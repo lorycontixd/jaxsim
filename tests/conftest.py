@@ -182,15 +182,15 @@ def jaxsim_model_ergocub() -> js.model.JaxSimModel:
     finally:
         _ = os.environ.pop("ROBOT_DESCRIPTION_COMMIT", None)
 
-    os.environ["ROBOT_DESCRIPTION_URI_PATH"] = (
-        robot_descriptions.ergocub_description.PACKAGE_PATH
-    )
+    from robot_descriptions._package_dirs import get_package_dirs
 
     model_urdf_path = pathlib.Path(
         robot_descriptions.ergocub_description.URDF_PATH.replace(
             "ergoCubSN000", "ergoCubSN001"
         )
     )
+
+    os.environ["MESH_PATH"] = get_package_dirs(robot_descriptions.ergocub_description)
 
     return build_jaxsim_model(model_description=model_urdf_path)
 
@@ -236,11 +236,11 @@ def jaxsim_model_ur10() -> js.model.JaxSimModel:
     """
 
     import robot_descriptions.ur10_description
-
-    os.environ["ROBOT_DESCRIPTION_URI_PATH"] = (
-        robot_descriptions.ur10_description.PACKAGE_PATH
-    )
+    from robot_descriptions._package_dirs import get_package_dirs
+    
     model_urdf_path = pathlib.Path(robot_descriptions.ur10_description.URDF_PATH)
+
+    os.environ["MESH_PATH"] = get_package_dirs(robot_descriptions.ur10_description)
 
     return build_jaxsim_model(model_description=model_urdf_path)
 
