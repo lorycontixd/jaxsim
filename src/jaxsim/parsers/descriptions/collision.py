@@ -1,6 +1,6 @@
 import abc
 import dataclasses
-from typing import List, Any
+from typing import Any, List
 
 import jax.numpy as jnp
 import numpy as np
@@ -129,4 +129,6 @@ class MeshCollision(CollisionShape):
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, MeshCollision):
             return False
-        return len(self.collidable_points) == len(other.collidable_points) and super().__eq__(other)
+        return len(self.collidable_points) == len(
+            other.collidable_points
+        ) and super().__eq__(other)
