@@ -174,7 +174,6 @@ def jaxsim_model_ergocub() -> js.model.JaxSimModel:
     Returns:
         The JaxSim model of the ErgoCub robot.
     """
-    import json
 
     try:
         os.environ["ROBOT_DESCRIPTION_COMMIT"] = "v0.7.1"
@@ -237,7 +236,6 @@ def jaxsim_model_ur10() -> js.model.JaxSimModel:
     Returns:
         The JaxSim model of the UR10 robot.
     """
-    import json
 
     import robot_descriptions.ur10_description
     from robot_descriptions._package_dirs import get_package_dirs
