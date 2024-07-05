@@ -5,17 +5,15 @@ import dataclasses
 import jax.lax
 import jax.numpy as jnp
 import jax_dataclasses
-import jaxlie
-import numpy as np
 from jax_dataclasses import Static
 
 import jaxsim.typing as jtp
-from jaxsim.math import Inertia, JointModel, supported_joint_motion
+from jaxsim.math import Adjoint, Inertia, JointModel, supported_joint_motion
 from jaxsim.parsers.descriptions import JointDescription, ModelDescription
 from jaxsim.utils import HashedNumpyArray, JaxsimDataclass
 
 
-@jax_dataclasses.pytree_dataclass
+@jax_dataclasses.pytree_dataclass(eq=False, unsafe_hash=False)
 class KynDynParameters(JaxsimDataclass):
     r"""
     Class storing the kinematic and dynamic parameters of a model.
@@ -26,6 +24,7 @@ class KynDynParameters(JaxsimDataclass):
         support_body_array_bool:
             The boolean support parent array :math:`\kappa_{b}(i)` of the model.
         link_parameters: The parameters of the links.
+        frame_parameters: The parameters of the frames.
         contact_parameters: The parameters of the collidable points.
         joint_model: The joint model of the model.
         joint_parameters: The parameters of the joints.
@@ -41,6 +40,9 @@ class KynDynParameters(JaxsimDataclass):
 
     # Contacts
     contact_parameters: ContactParameters
+
+    # Frames
+    frame_parameters: FrameParameters
 
     # Joints
     joint_model: JointModel
@@ -141,6 +143,19 @@ class KynDynParameters(JaxsimDataclass):
             model_description=model_description
         )
 
+        # =================
+        # Frames properties
+        # =================
+
+        # Create the object storing the parameters of frames.
+        # Note that, contrarily to LinkParameters and JointsParameters, this object
+        # is not created with vmap. This is because the "name" attribute of the object
+        # must be Static for JIT-related reasons, and tree_map would not consider it
+        # as a leaf.
+        frame_parameters = FrameParameters.build_from(
+            model_description=model_description
+        )
+
         # ===============
         # Tree properties
         # ===============
@@ -152,7 +167,7 @@ class KynDynParameters(JaxsimDataclass):
             for link in ordered_links
             if link.parent is not None
         }
-        parent_array = jnp.array([-1] + list(parent_array_dict.values()), dtype=int)
+        parent_array = jnp.array([-1, *list(parent_array_dict.values())], dtype=int)
 
         # Instead of building the support parent array κ(i) for each link of the model,
         # that has a variable length depending on the number of links connecting the
@@ -206,6 +221,7 @@ class KynDynParameters(JaxsimDataclass):
             joint_model=joint_model,
             joint_parameters=joint_parameters,
             contact_parameters=contact_parameters,
+            frame_parameters=frame_parameters,
         )
 
     def __eq__(self, other: KynDynParameters) -> bool:
@@ -221,7 +237,8 @@ class KynDynParameters(JaxsimDataclass):
             (
                 hash(self.number_of_links()),
                 hash(self.number_of_joints()),
-                hash(tuple(np.atleast_1d(self.parent_array).flatten().tolist())),
+                hash(self.frame_parameters.name),
+                hash(tuple(self.frame_parameters.body.tolist())),
                 hash(self._parent_array),
                 hash(self._support_body_array_bool),
             )
@@ -414,11 +431,9 @@ class KynDynParameters(JaxsimDataclass):
         # Compute the overall transforms from the parent to the child of each joint by
         # composing all the components of our joint model.
         i_X_λ = jax.vmap(
-            lambda λ_Hi_pre, pre_Hi_suc, suc_Hi_i: jaxlie.SE3.from_matrix(
-                λ_Hi_pre @ pre_Hi_suc @ suc_Hi_i
+            lambda λ_Hi_pre, pre_Hi_suc, suc_Hi_i: Adjoint.from_transform(
+                transform=λ_Hi_pre @ pre_Hi_suc @ suc_Hi_i, inverse=True
             )
-            .inverse()
-            .adjoint()
         )(λ_H_pre, pre_H_suc, suc_H_i)
 
         return i_X_λ, S
@@ -448,12 +463,12 @@ class KynDynParameters(JaxsimDataclass):
     def set_link_inertia(
         self, link_index: int, inertia: jtp.MatrixLike
     ) -> KynDynParameters:
-        """
+        r"""
         Set the inertia tensor of a link.
 
         Args:
             link_index: The index of the link.
-            inertia: The 3×3 inertia tensor of the link.
+            inertia: The :math:`3 \times 3` inertia tensor of the link.
 
         Returns:
             The updated kinematic and dynamic parameters of the model.
@@ -551,7 +566,7 @@ class LinkParameters(JaxsimDataclass):
         index: The index of the link.
         mass: The mass of the link.
         inertia_elements:
-            The unique elements of the 3×3 inertia tensor of the link.
+            The unique elements of the :math:`3 \times 3` inertia tensor of the link.
         center_of_mass:
             The translation :math:`{}^L \mathbf{p}_{\text{CoM}}` between the origin
             of the link frame and the link's center of mass, expressed in the
@@ -570,12 +585,12 @@ class LinkParameters(JaxsimDataclass):
 
     @staticmethod
     def build_from_spatial_inertia(index: jtp.IntLike, M: jtp.Matrix) -> LinkParameters:
-        """
-        Build a LinkParameters object from a 6×6 spatial inertia matrix.
+        r"""
+        Build a LinkParameters object from a :math:`6 \times 6` spatial inertia matrix.
 
         Args:
             index: The index of the link.
-            M: The 6×6 spatial inertia matrix of the link.
+            M: The :math:`6 \times 6` spatial inertia matrix of the link.
 
         Returns:
             The LinkParameters object.
@@ -598,13 +613,13 @@ class LinkParameters(JaxsimDataclass):
     def build_from_inertial_parameters(
         index: jtp.IntLike, m: jtp.FloatLike, I: jtp.MatrixLike, c: jtp.VectorLike
     ) -> LinkParameters:
-        """
+        r"""
         Build a LinkParameters object from the inertial parameters of a link.
 
         Args:
             index: The index of the link.
             m: The mass of the link.
-            I: The 3×3 inertia tensor of the link.
+            I: The :math:`3 \times 3` inertia tensor of the link.
             c: The translation between the link frame and the link's center of mass.
 
         Returns:
@@ -658,14 +673,14 @@ class LinkParameters(JaxsimDataclass):
 
     @staticmethod
     def inertia_tensor(params: LinkParameters) -> jtp.Matrix:
-        """
-        Return the 3×3 inertia tensor of a link.
+        r"""
+        Return the :math:`3 \times 3` inertia tensor of a link.
 
         Args:
             params: The link parameters.
 
         Returns:
-            The 3×3 inertia tensor of the link.
+            The :math:`3 \times 3` inertia tensor of the link.
         """
 
         return LinkParameters.unflatten_inertia_tensor(
@@ -674,14 +689,14 @@ class LinkParameters(JaxsimDataclass):
 
     @staticmethod
     def spatial_inertia(params: LinkParameters) -> jtp.Matrix:
-        """
-        Return the 6×6 spatial inertia matrix of a link.
+        r"""
+        Return the :math:`6 \times 6` spatial inertia matrix of a link.
 
         Args:
             params: The link parameters.
 
         Returns:
-            The 6×6 spatial inertia matrix of the link.
+            The :math:`6 \times 6` spatial inertia matrix of the link.
         """
 
         return Inertia.to_sixd(
@@ -692,11 +707,11 @@ class LinkParameters(JaxsimDataclass):
 
     @staticmethod
     def flatten_inertia_tensor(I: jtp.Matrix) -> jtp.Vector:
-        """
-        Flatten a 3×3 inertia tensor into a vector of unique elements.
+        r"""
+        Flatten a :math:`3 \times 3` inertia tensor into a vector of unique elements.
 
         Args:
-            I: The 3×3 inertia tensor.
+            I: The :math:`3 \times 3` inertia tensor.
 
         Returns:
             The vector of unique elements of the inertia tensor.
@@ -706,14 +721,14 @@ class LinkParameters(JaxsimDataclass):
 
     @staticmethod
     def unflatten_inertia_tensor(inertia_elements: jtp.Vector) -> jtp.Matrix:
-        """
-        Unflatten a vector of unique elements into a 3×3 inertia tensor.
+        r"""
+        Unflatten a vector of unique elements into a :math:`3 \times 3` inertia tensor.
 
         Args:
             inertia_elements: The vector of unique elements of the inertia tensor.
 
         Returns:
-            The 3×3 inertia tensor.
+            The :math:`3 \times 3` inertia tensor.
         """
 
         I = jnp.zeros([3, 3]).at[jnp.triu_indices(3)].set(inertia_elements.squeeze())
@@ -730,7 +745,7 @@ class ContactParameters(JaxsimDataclass):
             A tuple of integers representing, for each collidable point, the index of
             the body (link) to which it is rigidly attached to.
         point:
-            The translation between the link frame and the collidable point, expressed
+            The translations between the link frame and the collidable point, expressed
             in the coordinates of the parent link frame.
 
     Note:
@@ -773,10 +788,75 @@ class ContactParameters(JaxsimDataclass):
             links_dict[cp.parent_link.name].index for cp in collidable_points
         )
 
-        # Build the GroundContact object.
-        cp = ContactParameters(point=points, body=link_index_of_points)  # noqa
+        # Build the ContactParameters object.
+        cp = ContactParameters(point=points, body=link_index_of_points)
 
-        assert cp.point.shape[1] == 3
-        assert cp.point.shape[0] == len(cp.body)
+        assert cp.point.shape[1] == 3, cp.point.shape[1]
+        assert cp.point.shape[0] == len(cp.body), cp.point.shape[0]
 
         return cp
+
+
+@jax_dataclasses.pytree_dataclass
+class FrameParameters(JaxsimDataclass):
+    """
+    Class storing the frame parameters of a model.
+
+    Attributes:
+        name: A tuple of strings defining the frame names.
+        body:
+            A vector of integers representing, for each frame, the index of
+            the body (link) to which it is rigidly attached to.
+        transform: The transforms of the frames w.r.t. their parent link.
+
+    Note:
+        Contrarily to LinkParameters and JointParameters, this class is not meant
+        to be created with vmap. This is because the `name` attribute must be `Static`.
+    """
+
+    name: Static[tuple[str, ...]] = dataclasses.field(default_factory=tuple)
+
+    body: jtp.Vector = dataclasses.field(default_factory=lambda: jnp.array([]))
+
+    transform: jtp.Array = dataclasses.field(default_factory=lambda: jnp.array([]))
+
+    @staticmethod
+    def build_from(model_description: ModelDescription) -> FrameParameters:
+        """
+        Build a FrameParameters object from a model description.
+
+        Args:
+            model_description: The model description to consider.
+
+        Returns:
+            The FrameParameters object.
+        """
+
+        if len(model_description.frames) == 0:
+            return FrameParameters()
+
+        # Extract the frame names.
+        names = tuple(frame.name for frame in model_description.frames)
+
+        # For each frame, extract the index of the link to which it is attached to.
+        parent_link_index_of_frames = tuple(
+            model_description.links_dict[frame.parent.name].index
+            for frame in model_description.frames
+        )
+
+        # For each frame, extract the transform w.r.t. its parent link.
+        transforms = jnp.atleast_3d(
+            jnp.stack([frame.pose for frame in model_description.frames])
+        )
+
+        # Build the FrameParameters object.
+        fp = FrameParameters(
+            name=names,
+            transform=transforms.astype(float),
+            body=jnp.array(parent_link_index_of_frames).astype(int),
+        )
+
+        assert fp.transform.shape[1:] == (4, 4), fp.transform.shape[1:]
+        assert fp.transform.shape[0] == len(fp.body), fp.transform.shape[0]
+
+        return fp

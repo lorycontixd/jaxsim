@@ -8,6 +8,7 @@ import jaxsim.api as js
 import jaxsim.rbda
 import jaxsim.typing as jtp
 from jaxsim import VelRepr
+from jaxsim.rbda.contacts.soft import SoftContacts, SoftContactsParams
 
 # All JaxSim algorithms, excluding the variable-step integrators, should support
 # being automatically differentiated until second order, both in FWD and REV modes.
@@ -305,11 +306,12 @@ def test_ad_soft_contacts(
         p: jtp.VectorLike,
         v: jtp.VectorLike,
         m: jtp.VectorLike,
-        params: jaxsim.rbda.SoftContactsParams,
+        params: SoftContactsParams,
     ) -> tuple[jtp.Vector, jtp.Vector]:
-        return jaxsim.rbda.SoftContacts(parameters=params).contact_model(
+        W_f_Ci, (CW_ṁ,) = SoftContacts(parameters=params).compute_contact_forces(
             position=p, velocity=v, tangential_deformation=m
         )
+        return W_f_Ci, CW_ṁ
 
     # Check derivatives against finite differences.
     check_grads(
@@ -318,7 +320,7 @@ def test_ad_soft_contacts(
         order=AD_ORDER,
         modes=["rev", "fwd"],
         eps=ε,
-        # On GPU, the tolerance needs to be increased
+        # On GPU, the tolerance needs to be increased.
         rtol=0.02 if "gpu" in {d.platform for d in p.devices()} else None,
     )
 
@@ -341,7 +343,7 @@ def test_ad_integration(
     s = data.joint_positions(model=model)
     W_v_WB = data.base_velocity()
     ṡ = data.joint_velocities(model=model)
-    m = data.state.soft_contacts.tangential_deformation
+    m = data.state.contact.tangential_deformation
 
     # Inputs.
     W_f_L = references.link_forces(model=model)
@@ -371,14 +373,14 @@ def test_ad_integration(
 
     # Function exposing only the parameters to be differentiated.
     def step(
-        W_p_B: jax.typing.ArrayLike,
-        W_Q_B: jax.typing.ArrayLike,
-        s: jax.typing.ArrayLike,
-        W_v_WB: jax.typing.ArrayLike,
-        ṡ: jax.typing.ArrayLike,
-        m: jax.typing.ArrayLike,
-        τ: jax.typing.ArrayLike,
-        W_f_L: jax.typing.ArrayLike,
+        W_p_B: jtp.Vector,
+        W_Q_B: jtp.Vector,
+        s: jtp.Vector,
+        W_v_WB: jtp.Vector,
+        ṡ: jtp.Vector,
+        m: jtp.Vector,
+        τ: jtp.Vector,
+        W_f_L: jtp.Matrix,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
 
         # When JAX tests against finite differences, the injected ε will make the
@@ -395,9 +397,7 @@ def test_ad_integration(
                     base_angular_velocity=W_v_WB[3:6],
                     joint_velocities=ṡ,
                 ),
-                soft_contacts_state=js.ode_data.SoftContactsState.build(
-                    tangential_deformation=m
-                ),
+                contact=js.ode_data.SoftContactsState.build(tangential_deformation=m),
             ),
         )
 
@@ -416,7 +416,7 @@ def test_ad_integration(
         xf_s = data_xf.joint_positions(model=model)
         xf_W_v_WB = data_xf.base_velocity()
         xf_ṡ = data_xf.joint_velocities(model=model)
-        xf_m = data_xf.state.soft_contacts.tangential_deformation
+        xf_m = data_xf.state.contact.tangential_deformation
 
         return xf_W_p_B, xf_W_Q_B, xf_s, xf_W_v_WB, xf_ṡ, xf_m
 

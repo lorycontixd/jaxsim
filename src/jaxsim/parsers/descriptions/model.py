@@ -12,7 +12,7 @@ from .joint import JointDescription
 from .link import LinkDescription
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, eq=False, unsafe_hash=False)
 class ModelDescription(KinematicGraph):
     """
     Intermediate representation representing the kinematic graph of a robot model.
@@ -28,7 +28,7 @@ class ModelDescription(KinematicGraph):
     fixed_base: bool = True
 
     collision_shapes: tuple[CollisionShape, ...] = dataclasses.field(
-        default_factory=list, repr=False, hash=False
+        default_factory=list, repr=False
     )
 
     @staticmethod
@@ -176,7 +176,7 @@ class ModelDescription(KinematicGraph):
             frames=self.frames,
             collisions=tuple(self.collision_shapes),
             fixed_base=self.fixed_base,
-            base_link_name=list(iter(self))[0].name,
+            base_link_name=next(iter(self)).name,
             model_pose=self.root_pose,
             considered_joints=considered_joints,
         )
@@ -249,7 +249,17 @@ class ModelDescription(KinematicGraph):
         if not isinstance(other, ModelDescription):
             return False
 
-        return hash(self) == hash(other)
+        if not (
+            self.name == other.name
+            and self.fixed_base == other.fixed_base
+            and self.root == other.root
+            and self.joints == other.joints
+            and self.frames == other.frames
+            and self.root_pose == other.root_pose
+        ):
+            return False
+
+        return True
 
     def __hash__(self) -> int:
 

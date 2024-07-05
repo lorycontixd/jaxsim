@@ -9,20 +9,20 @@ from typing import Any, Sequence
 import jax
 import jax.numpy as jnp
 import jax_dataclasses
-import jaxlie
 import rod
 from jax_dataclasses import Static
 
 import jaxsim.api as js
-import jaxsim.parsers.descriptions
+import jaxsim.terrain
 import jaxsim.typing as jtp
-from jaxsim.math import Cross
-from jaxsim.utils import JaxsimDataclass, Mutability
+from jaxsim.math import Adjoint, Cross
+from jaxsim.parsers.descriptions import ModelDescription
+from jaxsim.utils import JaxsimDataclass, Mutability, wrappers
 
 from .common import VelRepr
 
 
-@jax_dataclasses.pytree_dataclass
+@jax_dataclasses.pytree_dataclass(eq=False, unsafe_hash=False)
 class JaxSimModel(JaxsimDataclass):
     """
     The JaxSim model defining the kinematics and dynamics of a robot.
@@ -31,35 +31,49 @@ class JaxSimModel(JaxsimDataclass):
     model_name: Static[str]
 
     terrain: Static[jaxsim.terrain.Terrain] = dataclasses.field(
-        default=jaxsim.terrain.FlatTerrain(), repr=False, compare=False, hash=False
+        default=jaxsim.terrain.FlatTerrain(), repr=False
+    )
+
+    contact_model: jaxsim.rbda.ContactModel | None = dataclasses.field(
+        default=None, repr=False
     )
 
     kin_dyn_parameters: js.kin_dyn_parameters.KynDynParameters | None = (
-        dataclasses.field(default=None, repr=False, compare=False, hash=False)
+        dataclasses.field(default=None, repr=False)
     )
 
     built_from: Static[str | pathlib.Path | rod.Model | None] = dataclasses.field(
-        default=None, repr=False, compare=False, hash=False
+        default=None, repr=False
     )
 
-    description: Static[jaxsim.parsers.descriptions.ModelDescription | None] = (
-        dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _description: Static[wrappers.HashlessObject[ModelDescription | None]] = (
+        dataclasses.field(default=None, repr=False)
     )
+
+    @property
+    def description(self) -> ModelDescription:
+        return self._description.get()
 
     def __eq__(self, other: JaxSimModel) -> bool:
 
         if not isinstance(other, JaxSimModel):
             return False
 
-        return hash(self) == hash(other)
+        if self.model_name != other.model_name:
+            return False
+
+        if self.kin_dyn_parameters != other.kin_dyn_parameters:
+            return False
+
+        return True
 
     def __hash__(self) -> int:
 
         return hash(
             (
                 hash(self.model_name),
-                hash(self.description),
                 hash(self.kin_dyn_parameters),
+                hash(self.contact_model),
             )
         )
 
@@ -73,6 +87,7 @@ class JaxSimModel(JaxsimDataclass):
         model_name: str | None = None,
         *,
         terrain: jaxsim.terrain.Terrain | None = None,
+        contact_model: jaxsim.rbda.ContactModel | None = None,
         is_urdf: bool | None = None,
         considered_joints: Sequence[str] | None = None,
     ) -> JaxSimModel:
@@ -101,7 +116,7 @@ class JaxSimModel(JaxsimDataclass):
         import jaxsim.parsers.rod
 
         # Parse the input resource (either a path to file or a string with the URDF/SDF)
-        # and build the -intermediate- model description
+        # and build the -intermediate- model description.
         intermediate_description = jaxsim.parsers.rod.build_model_description(
             model_description=model_description, is_urdf=is_urdf
         )
@@ -113,14 +128,15 @@ class JaxSimModel(JaxsimDataclass):
                 considered_joints=considered_joints
             )
 
-        # Build the model
+        # Build the model.
         model = JaxSimModel.build(
             model_description=intermediate_description,
             model_name=model_name,
             terrain=terrain,
+            contact_model=contact_model,
         )
 
-        # Store the origin of the model, in case downstream logic needs it
+        # Store the origin of the model, in case downstream logic needs it.
         with model.mutable_context(mutability=Mutability.MUTABLE_NO_VALIDATION):
             model.built_from = model_description
 
@@ -128,10 +144,11 @@ class JaxSimModel(JaxsimDataclass):
 
     @staticmethod
     def build(
-        model_description: jaxsim.parsers.descriptions.ModelDescription,
+        model_description: ModelDescription,
         model_name: str | None = None,
         *,
         terrain: jaxsim.terrain.Terrain | None = None,
+        contact_model: jaxsim.rbda.ContactModel | None = None,
     ) -> JaxSimModel:
         """
         Build a Model object from an intermediate model description.
@@ -144,22 +161,30 @@ class JaxSimModel(JaxsimDataclass):
                 The optional name of the model overriding the physics model name.
             terrain:
                 The optional terrain to consider.
+            contact_model:
+                The optional contact model to consider. If None, the soft contact model is used.
 
         Returns:
             The built Model object.
         """
+        from jaxsim.rbda.contacts.soft import SoftContacts
 
-        # Set the model name (if not provided, use the one from the model description)
+        # Set the model name (if not provided, use the one from the model description).
         model_name = model_name if model_name is not None else model_description.name
 
-        # Build the model
+        # Set the terrain (if not provided, use the default flat terrain).
+        terrain = terrain or JaxSimModel.__dataclass_fields__["terrain"].default
+        contact_model = contact_model or SoftContacts(terrain=terrain)
+
+        # Build the model.
         model = JaxSimModel(
             model_name=model_name,
-            description=model_description,
+            _description=wrappers.HashlessObject(obj=model_description),
             kin_dyn_parameters=js.kin_dyn_parameters.KynDynParameters.build(
                 model_description=model_description
             ),
-            terrain=terrain or JaxSimModel.__dataclass_fields__["terrain"].default,
+            terrain=terrain,
+            contact_model=contact_model,
         )
 
         return model
@@ -270,6 +295,10 @@ class JaxSimModel(JaxsimDataclass):
 
         return self.kin_dyn_parameters.link_names
 
+    # =====================
+    # Frame-related methods
+    # =====================
+
     def frame_names(self) -> tuple[str, ...]:
         """
         Return the names of the links in the model.
@@ -278,7 +307,7 @@ class JaxSimModel(JaxsimDataclass):
             The names of the links in the model.
         """
 
-        return tuple(frame.name for frame in self.description.frames)
+        return self.kin_dyn_parameters.frame_parameters.name
 
 
 # =====================
@@ -332,14 +361,15 @@ def reduce(
         considered_joints=list(considered_joints)
     )
 
-    # Build the reduced model
+    # Build the reduced model.
     reduced_model = JaxSimModel.build(
         model_description=reduced_intermediate_description,
         model_name=model.name(),
         terrain=model.terrain,
+        contact_model=model.contact_model,
     )
 
-    # Store the origin of the model, in case downstream logic needs it
+    # Store the origin of the model, in case downstream logic needs it.
     with reduced_model.mutable_context(mutability=Mutability.MUTABLE_NO_VALIDATION):
         reduced_model.built_from = model.built_from
 
@@ -463,7 +493,7 @@ def generalized_free_floating_jacobian(
         case VelRepr.Inertial:
 
             W_H_B = data.base_transform()
-            B_X_W = jaxlie.SE3.from_matrix(W_H_B).inverse().adjoint()
+            B_X_W = Adjoint.from_transform(transform=W_H_B, inverse=True)
 
             B_J_full_WX_I = B_J_full_WX_W = B_J_full_WX_B @ jax.scipy.linalg.block_diag(
                 B_X_W, jnp.eye(model.dofs())
@@ -477,7 +507,7 @@ def generalized_free_floating_jacobian(
 
             W_R_B = data.base_orientation(dcm=True)
             BW_H_B = jnp.eye(4).at[0:3, 0:3].set(W_R_B)
-            B_X_BW = jaxlie.SE3.from_matrix(BW_H_B).inverse().adjoint()
+            B_X_BW = Adjoint.from_transform(transform=BW_H_B, inverse=True)
 
             B_J_full_WX_I = B_J_full_WX_BW = (
                 B_J_full_WX_B
@@ -685,7 +715,7 @@ def forward_dynamics_aba(
 
         # In Mixed representation, we need to include a cross product in ℝ⁶.
         # In Inertial and Body representations, the cross product is always zero.
-        C_X_W = jaxlie.SE3.from_matrix(W_H_C).inverse().adjoint()
+        C_X_W = Adjoint.from_transform(transform=W_H_C, inverse=True)
         return C_X_W @ (W_v̇_WB - Cross.vx(W_v_WC) @ W_v_WB)
 
     match data.velocity_representation:
@@ -767,21 +797,21 @@ def forward_dynamics_crb(
     # Prepare data
     # ============
 
-    # Build joint torques if not provided
+    # Build joint torques if not provided.
     τ = (
         jnp.atleast_1d(joint_forces)
         if joint_forces is not None
         else jnp.zeros_like(data.joint_positions())
     )
 
-    # Build external forces if not provided
+    # Build external forces if not provided.
     f = (
         jnp.atleast_2d(link_forces)
         if link_forces is not None
         else jnp.zeros(shape=(model.number_of_links(), 6))
     )
 
-    # Compute terms of the floating-base EoM
+    # Compute terms of the floating-base EoM.
     M = free_floating_mass_matrix(model=model, data=data)
     h = free_floating_bias_forces(model=model, data=data)
     S = jnp.block([jnp.zeros(shape=(model.dofs(), 6)), jnp.eye(model.dofs())]).T
@@ -818,7 +848,7 @@ def forward_dynamics_crb(
     # 6D transformation X.
     v̇_WB = ν̇[0:6].squeeze().astype(float)
 
-    # Extract the joint accelerations
+    # Extract the joint accelerations.
     s̈ = jnp.atleast_1d(ν̇[6:].squeeze()).astype(float)
 
     return v̇_WB, s̈
@@ -850,7 +880,9 @@ def free_floating_mass_matrix(
 
         case VelRepr.Inertial:
 
-            B_X_W = jaxlie.SE3.from_matrix(data.base_transform()).inverse().adjoint()
+            B_X_W = Adjoint.from_transform(
+                transform=data.base_transform(), inverse=True
+            )
             invT = jax.scipy.linalg.block_diag(B_X_W, jnp.eye(model.dofs()))
 
             return invT.T @ M_body @ invT
@@ -858,7 +890,7 @@ def free_floating_mass_matrix(
         case VelRepr.Mixed:
 
             BW_H_B = data.base_transform().at[0:3, 3].set(jnp.zeros(3))
-            B_X_BW = jaxlie.SE3.from_matrix(BW_H_B).inverse().adjoint()
+            B_X_BW = Adjoint.from_transform(transform=BW_H_B, inverse=True)
             invT = jax.scipy.linalg.block_diag(B_X_BW, jnp.eye(model.dofs()))
 
             return invT.T @ M_body @ invT
@@ -1047,8 +1079,8 @@ def inverse_dynamics(
         expressed in a generic frame C to the inertial-fixed representation W_v̇_WB.
         """
 
-        W_X_C = jaxlie.SE3.from_matrix(W_H_C).adjoint()
-        C_X_W = jaxlie.SE3.from_matrix(W_H_C).inverse().adjoint()
+        W_X_C = Adjoint.from_transform(transform=W_H_C)
+        C_X_W = Adjoint.from_transform(transform=W_H_C, inverse=True)
         C_v_WC = C_X_W @ W_v_WC
 
         # In Mixed representation, we need to include a cross product in ℝ⁶.
@@ -1157,12 +1189,12 @@ def free_floating_gravity_forces(
         The free-floating gravity forces of the model.
     """
 
-    # Build a zeroed state
+    # Build a zeroed state.
     data_rnea = js.data.JaxSimModelData.zero(
         model=model, velocity_representation=data.velocity_representation
     )
 
-    # Set just the generalized position
+    # Set just the generalized position.
     with data_rnea.mutable_context(
         mutability=Mutability.MUTABLE, restore_after_exception=False
     ):
@@ -1207,12 +1239,12 @@ def free_floating_bias_forces(
         The free-floating bias forces of the model.
     """
 
-    # Build a zeroed state
+    # Build a zeroed state.
     data_rnea = js.data.JaxSimModelData.zero(
         model=model, velocity_representation=data.velocity_representation
     )
 
-    # Set the generalized position and generalized velocity
+    # Set the generalized position and generalized velocity.
     with data_rnea.mutable_context(
         mutability=Mutability.MUTABLE, restore_after_exception=False
     ):
@@ -1331,12 +1363,14 @@ def total_momentum_jacobian(
             B_Jh = B_Jh_B
 
         case VelRepr.Inertial:
-            B_X_W = jaxlie.SE3.from_matrix(data.base_transform()).inverse().adjoint()
+            B_X_W = Adjoint.from_transform(
+                transform=data.base_transform(), inverse=True
+            )
             B_Jh = B_Jh_B @ jax.scipy.linalg.block_diag(B_X_W, jnp.eye(model.dofs()))
 
         case VelRepr.Mixed:
             BW_H_B = data.base_transform().at[0:3, 3].set(jnp.zeros(3))
-            B_X_BW = jaxlie.SE3.from_matrix(BW_H_B).inverse().adjoint()
+            B_X_BW = Adjoint.from_transform(transform=BW_H_B, inverse=True)
             B_Jh = B_Jh_B @ jax.scipy.linalg.block_diag(B_X_BW, jnp.eye(model.dofs()))
 
         case _:
@@ -1348,14 +1382,14 @@ def total_momentum_jacobian(
 
         case VelRepr.Inertial:
             W_H_B = data.base_transform()
-            B_Xv_W = jaxlie.SE3.from_matrix(W_H_B).inverse().adjoint()
+            B_Xv_W = Adjoint.from_transform(transform=W_H_B, inverse=True)
             W_Xf_B = B_Xv_W.T
             W_Jh = W_Xf_B @ B_Jh
             return W_Jh
 
         case VelRepr.Mixed:
             BW_H_B = data.base_transform().at[0:3, 3].set(jnp.zeros(3))
-            B_Xv_BW = jaxlie.SE3.from_matrix(BW_H_B).inverse().adjoint()
+            B_Xv_BW = Adjoint.from_transform(transform=BW_H_B, inverse=True)
             BW_Xf_B = B_Xv_BW.T
             BW_Jh = BW_Xf_B @ B_Jh
             return BW_Jh
@@ -1419,7 +1453,7 @@ def average_velocity_jacobian(
             W_p_CoM = js.com.com_position(model=model, data=data)
 
             W_H_GW = jnp.eye(4).at[0:3, 3].set(W_p_CoM)
-            W_X_GW = jaxlie.SE3.from_matrix(W_H_GW).adjoint()
+            W_X_GW = Adjoint.from_transform(transform=W_H_GW)
 
             return W_X_GW @ GW_J
 
@@ -1431,7 +1465,7 @@ def average_velocity_jacobian(
             B_R_W = data.base_orientation(dcm=True).transpose()
 
             B_H_GB = jnp.eye(4).at[0:3, 3].set(B_R_W @ (W_p_CoM - W_p_B))
-            B_X_GB = jaxlie.SE3.from_matrix(B_H_GB).adjoint()
+            B_X_GB = Adjoint.from_transform(transform=B_H_GB)
 
             return B_X_GB @ GB_J
 
@@ -1442,7 +1476,7 @@ def average_velocity_jacobian(
             W_p_CoM = js.com.com_position(model=model, data=data)
 
             BW_H_GW = jnp.eye(4).at[0:3, 3].set(W_p_CoM - W_p_B)
-            BW_X_GW = jaxlie.SE3.from_matrix(BW_H_GW).adjoint()
+            BW_X_GW = Adjoint.from_transform(transform=BW_H_GW)
 
             return BW_X_GW @ GW_J
 
@@ -1488,8 +1522,8 @@ def link_bias_accelerations(
         expressed in a generic frame C to the inertial-fixed representation W_v̇_WB.
         """
 
-        W_X_C = jaxlie.SE3.from_matrix(W_H_C).adjoint()
-        C_X_W = jaxlie.SE3.from_matrix(W_H_C).inverse().adjoint()
+        W_X_C = Adjoint.from_transform(transform=W_H_C)
+        C_X_W = Adjoint.from_transform(transform=W_H_C, inverse=True)
 
         # In Mixed representation, we need to include a cross product in ℝ⁶.
         # In Inertial and Body representations, the cross product is always zero.
@@ -1576,7 +1610,7 @@ def link_bias_accelerations(
     # not remove gravity during the propagation.
 
     # Initialize the loop.
-    Carry = tuple[jtp.MatrixJax, jtp.MatrixJax]
+    Carry = tuple[jtp.Matrix, jtp.Matrix]
     carry0: Carry = (L_v_WL, L_v̇_WL)
 
     def propagate_accelerations(carry: Carry, i: jtp.Int) -> tuple[Carry, None]:
@@ -1802,8 +1836,8 @@ def step(
         integrator_state: The state of the integrator.
         joint_forces: The joint forces to consider.
         link_forces:
-            The link 6D forces to consider.
-            The frame in which they are expressed must be `data.velocity_representation`.
+            The 6D forces to apply to the links expressed in the frame corresponding to
+            the velocity representation of `data`.
         kwargs: Additional kwargs to pass to the integrator.
 
     Returns:
@@ -1811,7 +1845,13 @@ def step(
         and the new state of the integrator.
     """
 
-    integrator_kwargs = kwargs if kwargs is not None else dict()
+    # Extract the integrator kwargs.
+    # The following logic allows using integrators having kwargs colliding with the
+    # kwargs of this step function.
+    kwargs = kwargs if kwargs is not None else {}
+    integrator_kwargs = kwargs.pop("integrator_kwargs", {})
+    integrator_kwargs = kwargs | integrator_kwargs
+
     integrator_state = integrator_state if integrator_state is not None else dict()
 
     # Extract the initial resources.
@@ -1825,8 +1865,21 @@ def step(
         t0=jnp.array(t0_ns / 1e9).astype(float),
         dt=dt,
         params=integrator_state_x0,
+        # Always inject the current (model, data) pair into the system dynamics
+        # considered by the integrator, and include the input variables represented
+        # by the pair (joint_forces, link_forces).
+        # Note that the wrapper of the system dynamics will override (state_x0, t0)
+        # inside the passed data even if it is not strictly needed. This logic is
+        # necessary to re-use the jit-compiled step function of compatible pytrees
+        # of model and data produced e.g. by parameterized applications.
         **(
-            dict(joint_forces=joint_forces, link_forces=link_forces) | integrator_kwargs
+            dict(
+                model=model,
+                data=data,
+                joint_forces=joint_forces,
+                link_forces=link_forces,
+            )
+            | integrator_kwargs
         ),
     )
 
