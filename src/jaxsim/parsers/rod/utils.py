@@ -10,8 +10,8 @@ from rod.utils.resolve_uris import resolve_local_uri
 
 import jaxsim.typing as jtp
 from jaxsim import logging
-from jaxsim.math.inertia import Inertia
 from jaxsim.math.adjoint import Adjoint
+from jaxsim.math.inertia import Inertia
 from jaxsim.parsers import descriptions
 
 
