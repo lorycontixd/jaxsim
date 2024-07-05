@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 
+import numpy as np
 import jax.numpy as jnp
 import jax_dataclasses
 
@@ -149,10 +150,10 @@ class PlaneTerrain(FlatTerrain):
             return False
 
         if not (
-            jnp.allclose(self.z, other.z)
-            and jnp.allclose(
-                jnp.array(self.plane_normal, dtype=float),
-                jnp.array(other.plane_normal, dtype=float),
+            np.allclose(self.z, other.z)
+            and np.allclose(
+                np.array(self.plane_normal, dtype=float),
+                np.array(other.plane_normal, dtype=float),
             )
         ):
             return False
