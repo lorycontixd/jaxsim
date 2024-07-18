@@ -43,6 +43,10 @@ class MeshMappingMethod(ABC):
     def __call__(self, mesh: trimesh.Trimesh):
         return self.extract_points(mesh=mesh)
 
+    @abstractmethod
+    def __str__(self):
+        return self.__class__.__name__
+
 
 class VertexExtraction(MeshMappingMethod):
     def __init__(self):
@@ -51,6 +55,9 @@ class VertexExtraction(MeshMappingMethod):
     def extract_points(self, mesh: trimesh.Trimesh) -> np.ndarray:
         super().extract_points(mesh)
         return self.mesh.vertices
+
+    def __str__(self):
+        return "VertexExtraction"
 
 
 class RandomSurfaceSampling(MeshMappingMethod):
@@ -66,6 +73,9 @@ class RandomSurfaceSampling(MeshMappingMethod):
         super().extract_points(mesh)
         return self.mesh.sample(self.n)
 
+    def __str__(self):
+        return f"RandomSurfaceSampling(n={self.n})"
+
 
 class UniformSurfaceSampling(MeshMappingMethod):
     def __init__(self, n: int = -1):
@@ -79,6 +89,9 @@ class UniformSurfaceSampling(MeshMappingMethod):
     def extract_points(self, mesh: trimesh.Trimesh) -> np.ndarray:
         super().extract_points(mesh)
         return trimesh.sample.sample_surface_even(mesh=self.mesh, count=self.n)
+
+    def __str__(self):
+        return f"UniformSurfaceSampling(n={self.n})"
 
 
 class AAP(MeshMappingMethod):
@@ -123,6 +136,11 @@ class AAP(MeshMappingMethod):
 
         return points
 
+    def __str__(self):
+        return (
+            f"AAP(axis={self.axis}, operator={self.aap_operator}, value={self.value})"
+        )
+
 
 class SelectPointsOverAxis(MeshMappingMethod):
     def __init__(self, axis: str, direction: str, n: int):
@@ -154,6 +172,9 @@ class SelectPointsOverAxis(MeshMappingMethod):
 
         return points
 
+    def __str__(self):
+        return f"SelectPointsOverAxis(axis={self.axis}, direction={self.direction}, n={self.n})"
+
 
 class ObjectMapping(MeshMappingMethod):
     def __init__(
@@ -170,6 +191,8 @@ class ObjectMapping(MeshMappingMethod):
 
     def extract_points(self, mesh: trimesh.Trimesh) -> np.ndarray:
         super().extract_points(mesh)
+        if len(self.objs) == 0:
+            return mesh.vertices
         if self.method == "subtract":
             for obj in self.objs:
                 mesh = mesh.difference(obj)
@@ -180,3 +203,6 @@ class ObjectMapping(MeshMappingMethod):
             raise ValueError(f"Invalid method {self.method} for object mapping")
 
         return mesh.vertices
+
+    def __str__(self):
+        return f"ObjectMapping(method={self.method}, objs={len(self.objs)})"

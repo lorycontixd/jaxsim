@@ -233,9 +233,11 @@ def create_mesh_collision(
         method = meshes.VertexExtraction()
         logging.debug("Using default Vertex Extraction method for mesh wrapping")
     else:
-        logging.debug(f"Using {method.__class__.__name__} method for mesh wrapping")
+        logging.debug(f"Using method {method} for mesh wrapping")
 
     points = method(mesh=mesh)
+    logging.debug(f"Extracted {len(points)} points from mesh")
+
     H = collision.pose.transform() if collision.pose is not None else np.eye(4)
     # Extract translation from transformation matrix
     center_of_collision_wrt_link = H[:3, 3]
