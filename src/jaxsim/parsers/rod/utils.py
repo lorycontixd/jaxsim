@@ -1,4 +1,3 @@
-import enum
 import os
 import pathlib
 
@@ -6,20 +5,16 @@ import numpy as np
 import numpy.typing as npt
 import rod
 import trimesh
+import inspect
 from rod.utils.resolve_uris import resolve_local_uri
+
 
 import jaxsim.typing as jtp
 from jaxsim import logging
 from jaxsim.math.adjoint import Adjoint
 from jaxsim.math.inertia import Inertia
 from jaxsim.parsers import descriptions
-
-
-@enum.unique
-class MeshMappingMethods(enum.IntEnum):
-    VertexExtraction = enum.auto()
-    RandomSurfaceSampling = enum.auto()
-    UniformSurfaceSampling = enum.auto()
+from jaxsim.parsers.rod import meshes
 
 
 def from_sdf_inertial(inertial: rod.Inertial) -> jtp.Matrix:
@@ -220,9 +215,15 @@ def create_sphere_collision(
 def create_mesh_collision(
     collision: rod.Collision,
     link_description: descriptions.LinkDescription,
-    method: MeshMappingMethods = MeshMappingMethods.VertexExtraction,
+    method: meshes.MeshMappingMethod = meshes.VertexExtraction(),
     nsamples: int = 1000,
+    axis: str = "z",
+    direction: str = "lower",
+    operator: str = "<",
+    value: float = 0.0,
+    obj: trimesh.Trimesh | dict = None,
 ) -> descriptions.MeshCollision:
+
     file = pathlib.Path(resolve_local_uri(uri=collision.geometry.mesh.uri))
     _file_type = file.suffix.replace(".", "")
     mesh = trimesh.load_mesh(file, file_type=_file_type)
@@ -237,15 +238,8 @@ def create_mesh_collision(
     )
 
     # Extract the points from the mesh to use as colliders according to the provided method
-    match method:
-        case MeshMappingMethods.VertexExtraction:
-            points = mesh.vertices
-        case MeshMappingMethods.RandomSurfaceSampling:
-            points = mesh.sample(nsamples)
-        case MeshMappingMethods.UniformSurfaceSampling:
-            points = trimesh.sample.sample_surface_even(mesh=mesh, count=nsamples)
-        case _:
-            raise ValueError("Invalid mesh mapping method")
+    if method is not None:
+        points = method(mesh=mesh)
 
     points = mesh.vertices
     H = collision.pose.transform() if collision.pose is not None else np.eye(4)
