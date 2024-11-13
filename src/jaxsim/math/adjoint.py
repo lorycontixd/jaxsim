@@ -3,7 +3,6 @@ import jaxlie
 
 import jaxsim.typing as jtp
 
-from .quaternion import Quaternion
 from .skew import Skew
 
 
@@ -31,7 +30,7 @@ class Adjoint:
         assert quaternion.size == 4
         assert translation.size == 3
 
-        Q_sixd = jaxlie.SO3.from_quaternion_xyzw(xyzw=Quaternion.to_xyzw(quaternion))
+        Q_sixd = jaxlie.SO3(wxyz=quaternion)
         Q_sixd = Q_sixd if not normalize_quaternion else Q_sixd.normalize()
 
         return Adjoint.from_rotation_and_translation(
@@ -84,14 +83,14 @@ class Adjoint:
         A_o_B = translation.squeeze()
 
         if not inverse:
-            X = A_X_B = jnp.vstack(
+            X = A_X_B = jnp.vstack(  # noqa: F841
                 [
                     jnp.block([A_R_B, Skew.wedge(A_o_B) @ A_R_B]),
                     jnp.block([jnp.zeros(shape=(3, 3)), A_R_B]),
                 ]
             )
         else:
-            X = B_X_A = jnp.vstack(
+            X = B_X_A = jnp.vstack(  # noqa: F841
                 [
                     jnp.block([A_R_B.T, -A_R_B.T @ Skew.wedge(A_o_B)]),
                     jnp.block([jnp.zeros(shape=(3, 3)), A_R_B.T]),
@@ -138,11 +137,12 @@ class Adjoint:
             jtp.Matrix: The inverse adjoint matrix.
         """
         A_X_B = adjoint
-        A_H_B = Adjoint.to_transform(adjoint=A_X_B)
 
-        A_R_B = A_H_B[0:3, 0:3]
-        A_o_B = A_H_B[0:3, 3]
+        A_R_B = A_X_B[0:3, 0:3]
 
-        return Adjoint.from_rotation_and_translation(
-            rotation=A_R_B, translation=A_o_B, inverse=True
+        return jnp.vstack(
+            [
+                jnp.block([A_R_B.T, -A_R_B.T @ A_X_B[0:3, 3:6] @ A_R_B.T]),
+                jnp.block([jnp.zeros(shape=(3, 3)), A_R_B.T]),
+            ]
         )

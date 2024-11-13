@@ -1,15 +1,16 @@
 import abc
 import dataclasses
-from typing import Any, ClassVar, Generic, Protocol, Type, TypeVar
+from typing import Any, ClassVar, Generic, Protocol, TypeVar
 
 import jax
 import jax.numpy as jnp
 import jax_dataclasses
-import jaxlie
 from jax_dataclasses import Static
 
 import jaxsim.api as js
+import jaxsim.math
 import jaxsim.typing as jtp
+from jaxsim import exceptions, logging
 from jaxsim.utils.jaxsim_dataclass import JaxsimDataclass, Mutability
 
 try:
@@ -48,22 +49,17 @@ class SystemDynamics(Protocol[State, StateDerivative]):
 @jax_dataclasses.pytree_dataclass
 class Integrator(JaxsimDataclass, abc.ABC, Generic[State, StateDerivative]):
 
-    AfterInitKey: ClassVar[str] = "after_init"
-    InitializingKey: ClassVar[str] = "initializing"
-
-    AuxDictDynamicsKey: ClassVar[str] = "aux_dict_dynamics"
-
     dynamics: Static[SystemDynamics[State, StateDerivative]] = dataclasses.field(
         repr=False, hash=False, compare=False, kw_only=True
     )
 
-    params: dict[str, Any] = dataclasses.field(
+    metadata: dict[str, Any] = dataclasses.field(
         default_factory=dict, repr=False, hash=False, compare=False, kw_only=True
     )
 
     @classmethod
     def build(
-        cls: Type[Self],
+        cls: type[Self],
         *,
         dynamics: SystemDynamics[State, StateDerivative],
         **kwargs,
@@ -87,9 +83,9 @@ class Integrator(JaxsimDataclass, abc.ABC, Generic[State, StateDerivative]):
         t0: Time,
         dt: TimeStep,
         *,
-        params: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
         **kwargs,
-    ) -> tuple[State, dict[str, Any]]:
+    ) -> tuple[NextState, dict[str, Any]]:
         """
         Perform a single integration step.
 
@@ -97,25 +93,30 @@ class Integrator(JaxsimDataclass, abc.ABC, Generic[State, StateDerivative]):
             x0: The initial state of the system.
             t0: The initial time of the system.
             dt: The time step of the integration.
-            params: The auxiliary dictionary of the integrator.
+            metadata: The state auxiliary dictionary of the integrator.
             **kwargs: Additional keyword arguments.
 
         Returns:
             The final state of the system and the updated auxiliary dictionary.
         """
 
+        metadata = metadata if metadata is not None else {}
+
         with self.editable(validate=False) as integrator:
-            integrator.params = params
+            integrator.metadata = metadata
 
         with integrator.mutable_context(mutability=Mutability.MUTABLE):
-            xf = integrator(x0, t0, dt, **kwargs)
+            xf, metadata_step = integrator(x0, t0, dt, **kwargs)
 
-        return xf, integrator.params | {
-            Integrator.AfterInitKey: jnp.array(False).astype(bool)
-        }
+        return (
+            xf,
+            metadata | metadata_step,
+        )
 
     @abc.abstractmethod
-    def __call__(self, x0: State, t0: Time, dt: TimeStep, **kwargs) -> NextState:
+    def __call__(
+        self, x0: State, t0: Time, dt: TimeStep, **kwargs
+    ) -> tuple[NextState, dict[str, Any]]:
         pass
 
     def init(
@@ -127,64 +128,12 @@ class Integrator(JaxsimDataclass, abc.ABC, Generic[State, StateDerivative]):
         include_dynamics_aux_dict: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
-        """
-        Initialize the integrator.
 
-        Args:
-            x0: The initial state of the system.
-            t0: The initial time of the system.
-            dt: The time step of the integration.
-
-        Returns:
-            The auxiliary dictionary of the integrator.
-
-        Note:
-            This method should have the same signature as the inherited `__call__`
-            method, including additional kwargs.
-
-        Note:
-            If the integrator supports FSAL, the pair `(x0, t0)` must match the real
-            initial state and time of the system, otherwise the initial derivative of
-            the first step will be wrong.
-        """
-
-        with self.editable(validate=False) as integrator:
-
-            # Initialize the integrator parameters.
-            # For initialization purpose, the integrators can check if the
-            # `Integrator.InitializingKey` is present in their parameters.
-            # The AfterInitKey is used in the first step after initialization.
-            integrator.params = {
-                Integrator.InitializingKey: jnp.array(True),
-                Integrator.AfterInitKey: jnp.array(False),
-            }
-
-            # Run a dummy call of the integrator.
-            # It is used only to get the params so that we know the structure
-            # of the corresponding pytree.
-            _ = integrator(x0, t0, dt, **kwargs)
-
-        # Remove the injected key.
-        _ = integrator.params.pop(Integrator.InitializingKey)
-
-        # Make sure that all leafs of the dictionary are JAX arrays.
-        # Also, since these are dummy parameters, set them all to zero.
-        params_after_init = jax.tree_util.tree_map(
-            lambda l: jnp.zeros_like(l), integrator.params
+        logging.warning(
+            "The 'init' method has been deprecated. There is no need to call it."
         )
 
-        # Mark the next step as first step after initialization.
-        params_after_init = params_after_init | {
-            Integrator.AfterInitKey: jnp.array(True)
-        }
-
-        # Store the zero parameters in the integrator.
-        # When the integrator is stepped, this is used to check if the passed
-        # parameters are valid.
-        with self.mutable_context(mutability=Mutability.MUTABLE_NO_VALIDATION):
-            self.params = params_after_init
-
-        return params_after_init
+        return {}
 
 
 @jax_dataclasses.pytree_dataclass
@@ -223,7 +172,7 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
     @override
     @classmethod
     def build(
-        cls: Type[Self],
+        cls: type[Self],
         *,
         dynamics: SystemDynamics[State, StateDerivative],
         fsal_enabled_if_supported: jtp.BoolLike = True,
@@ -260,8 +209,10 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
         # Check if the Butcher tableau supports FSAL (first-same-as-last).
         # If it does, store the index of the intermediate derivative to be used as the
         # first derivative of the next iteration.
-        has_fsal, index_of_fsal = ExplicitRungeKutta.butcher_tableau_supports_fsal(
-            A=cls.A, b=cls.b, c=cls.c, index_of_solution=cls.row_index_of_solution
+        has_fsal, index_of_fsal = (  # noqa: F841
+            ExplicitRungeKutta.butcher_tableau_supports_fsal(
+                A=cls.A, b=cls.b, c=cls.c, index_of_solution=cls.row_index_of_solution
+            )
         )
 
         # Build the integrator object.
@@ -274,15 +225,19 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
 
         return integrator
 
-    def __call__(self, x0: State, t0: Time, dt: TimeStep, **kwargs) -> NextState:
+    def __call__(
+        self, x0: State, t0: Time, dt: TimeStep, **kwargs
+    ) -> tuple[NextState, dict[str, Any]]:
 
         # Here z is a batched state with as many batch elements as b.T rows.
         # Note that z has multiple batches only if b.T has more than one row,
         # e.g. in Butcher tableau of embedded schemes.
-        z = self._compute_next_state(x0=x0, t0=t0, dt=dt, **kwargs)
+        z, aux_dict = self._compute_next_state(x0=x0, t0=t0, dt=dt, **kwargs)
 
         # The next state is the batch element located at the configured index of solution.
-        return jax.tree_util.tree_map(lambda l: l[self.row_index_of_solution], z)
+        next_state = jax.tree.map(lambda l: l[self.row_index_of_solution], z)
+
+        return next_state, aux_dict
 
     @classmethod
     def integrate_rk_stage(
@@ -317,7 +272,7 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
         """
 
         op = lambda x0_leaf, k_leaf: x0_leaf + dt * k_leaf
-        return jax.tree_util.tree_map(op, x0, k)
+        return jax.tree.map(op, x0, k)
 
     @classmethod
     def post_process_state(
@@ -340,7 +295,7 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
 
     def _compute_next_state(
         self, x0: State, t0: Time, dt: TimeStep, **kwargs
-    ) -> NextState:
+    ) -> tuple[NextState, dict[str, Any]]:
         """
         Compute the next state of the system, returning all the output states.
 
@@ -364,29 +319,33 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
         f = lambda x, t: self.dynamics(x=x, t=t, **kwargs)
 
         # Initialize the carry of the for loop with the stacked kᵢ vectors.
-        carry0 = jax.tree_util.tree_map(
-            lambda l: jnp.repeat(jnp.zeros_like(l)[jnp.newaxis, ...], c.size, axis=0),
-            x0,
+        carry0 = jax.tree_map(
+            lambda l: jnp.zeros((c.size, *l.shape), dtype=l.dtype), x0
         )
 
-        # Apply FSAL property by passing ẋ0 = f(x0, t0) from the previous iteration.
-        get_ẋ0 = lambda: self.params.get("dxdt0", f(x0, t0)[0])
+        # Closure on metadata to either evaluate the dynamics at the initial state
+        # or to use the previous state derivative (only integrators supporting FSAL).
+        def get_ẋ0_and_aux_dict() -> tuple[StateDerivative, dict[str, Any]]:
+            ẋ0, aux_dict = f(x0, t0)
+            return self.metadata.get("dxdt0", ẋ0), aux_dict
 
         # We use a `jax.lax.scan` to compile the `f` function only once.
         # Otherwise, if we compute e.g. for RK4 sequentially, the jit-compiled code
         # would include 4 repetitions of the `f` logic, making everything extremely slow.
-        def scan_body(carry: jax.Array, i: int | jax.Array) -> tuple[jax.Array, None]:
+        def scan_body(
+            carry: jax.Array, i: int | jax.Array
+        ) -> tuple[jax.Array, dict[str, Any]]:
             """"""
 
             # Unpack the carry, i.e. the stacked kᵢ vectors.
             K = carry
 
             # Define the computation of the Runge-Kutta stage.
-            def compute_ki() -> jax.Array:
+            def compute_ki() -> tuple[jax.Array, dict[str, Any]]:
 
                 # Compute ∑ⱼ aᵢⱼ kⱼ.
                 op_sum_ak = lambda k: jnp.einsum("s,s...->...", A[i], k)
-                sum_ak = jax.tree_util.tree_map(op_sum_ak, K)
+                sum_ak = jax.tree.map(op_sum_ak, K)
 
                 # Compute the next state for the kᵢ evaluation.
                 # Note that this is not a Δt integration since aᵢⱼ could be fractional.
@@ -395,25 +354,26 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
                 # Compute the next time for the kᵢ evaluation.
                 ti = t0 + c[i] * Δt
 
-                # This is kᵢ = f(xᵢ, tᵢ).
-                return f(xi, ti)[0]
+                # Evaluate the dynamics.
+                ki, aux_dict = f(xi, ti)
+                return ki, aux_dict
 
             # This selector enables FSAL property in the first iteration (i=0).
-            ki = jax.lax.cond(
+            ki, aux_dict = jax.lax.cond(
                 pred=jnp.logical_and(i == 0, self.has_fsal),
-                true_fun=get_ẋ0,
+                true_fun=get_ẋ0_and_aux_dict,
                 false_fun=compute_ki,
             )
 
             # Store the kᵢ derivative in K.
             op = lambda l_k, l_ki: l_k.at[i].set(l_ki)
-            K = jax.tree_util.tree_map(op, K, ki)
+            K = jax.tree.map(op, K, ki)
 
             carry = K
-            return carry, None
+            return carry, aux_dict
 
         # Compute the state derivatives kᵢ.
-        K, _ = jax.lax.scan(
+        K, aux_dict = jax.lax.scan(
             f=scan_body,
             init=carry0,
             xs=jnp.arange(c.size),
@@ -421,14 +381,12 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
 
         # Update the FSAL property for the next iteration.
         if self.has_fsal:
-            self.params["dxdt0"] = jax.tree_util.tree_map(
-                lambda l: l[self.index_of_fsal], K
-            )
+            self.metadata["dxdt0"] = jax.tree.map(lambda l: l[self.index_of_fsal], K)
 
         # Compute the output state.
         # Note that z contains as many new states as the rows of `b.T`.
         op = lambda x0, k: x0 + Δt * jnp.einsum("zs,s...->z...", b.T, k)
-        z = jax.tree_util.tree_map(op, x0, K)
+        z = jax.tree.map(op, x0, K)
 
         # Transform the final state of the integration.
         # This allows to inject custom logic, if needed.
@@ -436,7 +394,7 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
             lambda xf: self.post_process_state(x0=x0, t0=t0, xf=xf, dt=dt)
         )(z)
 
-        return z_transformed
+        return z_transformed, aux_dict
 
     @staticmethod
     def butcher_tableau_is_valid(
@@ -485,7 +443,7 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
         b: jtp.Matrix,
         c: jtp.Vector,
         index_of_solution: jtp.IntLike = 0,
-    ) -> [bool, int | None]:
+    ) -> tuple[bool, int | None]:
         """
         Check if the Butcher tableau supports the FSAL (first-same-as-last) property.
 
@@ -506,7 +464,7 @@ class ExplicitRungeKutta(Integrator[PyTreeType, PyTreeType], Generic[PyTreeType]
             raise ValueError("The Butcher tableau is not valid.")
 
         if not ExplicitRungeKutta.butcher_tableau_is_explicit(A=A):
-            return False
+            return False, None
 
         if index_of_solution >= b.T.shape[0]:
             msg = "The index of the solution (i-th row of `b.T`) is out of range."
@@ -540,47 +498,37 @@ class ExplicitRungeKuttaSO3Mixin:
     """
 
     @classmethod
-    def integrate_rk_stage(
-        cls, x0: js.ode_data.ODEState, t0: Time, dt: TimeStep, k: js.ode_data.ODEState
-    ) -> js.ode_data.ODEState:
-
-        op = lambda x0_leaf, k_leaf: x0_leaf + dt * k_leaf
-        xf: js.ode_data.ODEState = jax.tree_util.tree_map(op, x0, k)
-
-        W_Q_B_tf = xf.physics_model.base_quaternion
-
-        return xf.replace(
-            physics_model=xf.physics_model.replace(
-                base_quaternion=W_Q_B_tf / jnp.linalg.norm(W_Q_B_tf)
-            )
-        )
-
-    @classmethod
     def post_process_state(
         cls, x0: js.ode_data.ODEState, t0: Time, xf: js.ode_data.ODEState, dt: TimeStep
     ) -> js.ode_data.ODEState:
 
-        # Indices to convert quaternions between serializations.
-        to_xyzw = jnp.array([1, 2, 3, 0])
+        # Extract the initial base quaternion.
+        W_Q_B_t0 = x0.physics_model.base_quaternion
 
-        # Get the initial rotation.
-        W_R_B_t0 = jaxlie.SO3.from_quaternion_xyzw(
-            xyzw=x0.physics_model.base_quaternion[to_xyzw]
+        # We assume that the initial quaternion is already unary.
+        exceptions.raise_runtime_error_if(
+            condition=jnp.logical_not(jnp.allclose(W_Q_B_t0.dot(W_Q_B_t0), 1.0)),
+            msg="The SO(3) integrator received a quaternion at t0 that is not unary.",
         )
 
-        # Get the final angular velocity.
-        # This is already computed by averaging the kᵢ in RK-based schemes.
-        # Therefore, by using the ω at tf, we obtain a RK scheme operating
-        # on the SO(3) manifold.
-        W_ω_WB_tf = xf.physics_model.base_angular_velocity
+        # Get the angular velocity ω to integrate the quaternion.
+        # This velocity ω[t0] is computed in the previous timestep by averaging the kᵢ
+        # corresponding to the active RK-based scheme. Therefore, by using the ω[t0],
+        # we obtain an explicit RK scheme operating on the SO(3) manifold.
+        # Note that the current integrator is not a semi-implicit scheme, therefore
+        # using the final ω[tf] would be not correct.
+        W_ω_WB_t0 = x0.physics_model.base_angular_velocity
 
-        # Integrate the orientation on SO(3).
-        # Note that we left-multiply with the exponential map since the angular
-        # velocity is expressed in the inertial frame.
-        W_R_B_tf = jaxlie.SO3.exp(tangent=dt * W_ω_WB_tf) @ W_R_B_t0
+        # Integrate the quaternion on SO(3).
+        W_Q_B_tf = jaxsim.math.Quaternion.integration(
+            quaternion=W_Q_B_t0,
+            dt=dt,
+            omega=W_ω_WB_t0,
+            omega_in_body_fixed=False,
+        )
 
         # Replace the quaternion in the final state.
         return xf.replace(
-            physics_model=xf.physics_model.replace(base_quaternion=W_R_B_tf.wxyz),
+            physics_model=xf.physics_model.replace(base_quaternion=W_Q_B_tf),
             validate=True,
         )

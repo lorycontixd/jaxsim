@@ -1,5 +1,5 @@
 import functools
-from typing import Sequence
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -122,8 +122,11 @@ def position_limit(
         The position limits of the joint.
     """
 
-    if model.number_of_joints() <= 1:
-        return jnp.empty(0).astype(float), jnp.empty(0).astype(float)
+    if model.number_of_joints() == 0:
+        s_min = model.kin_dyn_parameters.joint_parameters.position_limits_min
+        s_max = model.kin_dyn_parameters.joint_parameters.position_limits_max
+
+        return jnp.atleast_1d(s_min).astype(float), jnp.atleast_1d(s_max).astype(float)
 
     exceptions.raise_value_error_if(
         condition=jnp.array(
@@ -154,13 +157,19 @@ def position_limits(
         The position limits of the joints.
     """
 
-    joint_names = joint_names if joint_names is not None else model.joint_names()
+    joint_idxs = (
+        names_to_idxs(joint_names=joint_names, model=model)
+        if joint_names is not None
+        else jnp.arange(model.number_of_joints())
+    )
 
-    if len(joint_names) == 0:
+    if len(joint_idxs) == 0:
         return jnp.empty(0).astype(float), jnp.empty(0).astype(float)
 
-    joint_idxs = names_to_idxs(joint_names=joint_names, model=model)
-    return jax.vmap(lambda i: position_limit(model=model, joint_index=i))(joint_idxs)
+    s_min = model.kin_dyn_parameters.joint_parameters.position_limits_min[joint_idxs]
+    s_max = model.kin_dyn_parameters.joint_parameters.position_limits_max[joint_idxs]
+
+    return s_min.astype(float), s_max.astype(float)
 
 
 # ======================
@@ -180,17 +189,81 @@ def random_joint_positions(
 
     Args:
         model: The model to consider.
-        joint_names: The names of the joints.
-        key: The random key.
+        joint_names: The names of the considered joints (all if None).
+        key: The random key (initialized from seed 0 if None).
+
+    Note:
+        If the joint range or revolute joints is larger than 2π, their joint positions
+        will be sampled from an interval of size 2π.
 
     Returns:
         The random joint positions.
     """
 
+    # Consider the key corresponding to a zero seed if it was not passed.
     key = key if key is not None else jax.random.PRNGKey(seed=0)
 
+    # Get the joint limits parsed from the model description.
     s_min, s_max = position_limits(model=model, joint_names=joint_names)
 
+    # Get the joint indices.
+    # Note that it will trigger an exception if the given `joint_names` are not valid.
+    joint_names = joint_names if joint_names is not None else model.joint_names()
+    joint_indices = (
+        names_to_idxs(model=model, joint_names=joint_names)
+        if joint_names is not None
+        else jnp.arange(model.number_of_joints())
+    )
+
+    from jaxsim.parsers.descriptions.joint import JointType
+
+    # Filter for revolute joints.
+    is_revolute = jnp.where(
+        jnp.array(model.kin_dyn_parameters.joint_model.joint_types[1:])[joint_indices]
+        == JointType.Revolute,
+        True,
+        False,
+    )
+
+    # Shorthand for π.
+    π = jnp.pi
+
+    # Filter for revolute with full range (or continuous).
+    is_revolute_full_range = jnp.logical_and(is_revolute, s_max - s_min >= 2 * π)
+
+    # Clip the lower limit to -π if the joint range is larger than [-π, π].
+    s_min = jnp.where(
+        jnp.logical_and(
+            is_revolute_full_range, jnp.logical_and(s_min <= -π, s_max >= π)
+        ),
+        -π,
+        s_min,
+    )
+
+    # Clip the upper limit to +π if the joint range is larger than [-π, π].
+    s_max = jnp.where(
+        jnp.logical_and(
+            is_revolute_full_range, jnp.logical_and(s_min <= -π, s_max >= π)
+        ),
+        π,
+        s_max,
+    )
+
+    # Shift the lower limit if the upper limit is smaller than +π.
+    s_min = jnp.where(
+        jnp.logical_and(is_revolute_full_range, s_max < π),
+        s_max - 2 * π,
+        s_min,
+    )
+
+    # Shift the upper limit if the lower limit is larger than -π.
+    s_max = jnp.where(
+        jnp.logical_and(is_revolute_full_range, s_min > -π),
+        s_min + 2 * π,
+        s_max,
+    )
+
+    # Sample the joint positions.
     s_random = jax.random.uniform(
         minval=s_min,
         maxval=s_max,

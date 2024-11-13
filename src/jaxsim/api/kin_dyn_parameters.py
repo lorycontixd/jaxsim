@@ -5,6 +5,8 @@ import dataclasses
 import jax.lax
 import jax.numpy as jnp
 import jax_dataclasses
+import numpy as np
+import numpy.typing as npt
 from jax_dataclasses import Static
 
 import jaxsim.typing as jtp
@@ -98,9 +100,7 @@ class KynDynParameters(JaxsimDataclass):
         ]
 
         # Create a vectorized object of link parameters.
-        link_parameters = jax.tree_util.tree_map(
-            lambda *l: jnp.stack(l), *link_parameters_list
-        )
+        link_parameters = jax.tree.map(lambda *l: jnp.stack(l), *link_parameters_list)
 
         # =================
         # Joints properties
@@ -114,7 +114,7 @@ class KynDynParameters(JaxsimDataclass):
 
         # Create a vectorized object of joint parameters.
         joint_parameters = (
-            jax.tree_util.tree_map(lambda *l: jnp.stack(l), *joint_parameters_list)
+            jax.tree.map(lambda *l: jnp.stack(l), *joint_parameters_list)
             if len(ordered_joints) > 0
             else JointParameters(
                 index=jnp.array([], dtype=int),
@@ -238,7 +238,7 @@ class KynDynParameters(JaxsimDataclass):
                 hash(self.number_of_links()),
                 hash(self.number_of_joints()),
                 hash(self.frame_parameters.name),
-                hash(tuple(self.frame_parameters.body.tolist())),
+                hash(self.frame_parameters.body),
                 hash(self._parent_array),
                 hash(self._support_body_array_bool),
             )
@@ -398,9 +398,7 @@ class KynDynParameters(JaxsimDataclass):
         λ_H_pre = jnp.vstack(
             [
                 jnp.eye(4)[jnp.newaxis],
-                jax.vmap(
-                    lambda i: self.joint_model.parent_H_predecessor(joint_index=i)
-                )(jnp.arange(1, 1 + self.number_of_joints())),
+                self.joint_model.λ_H_pre[1 : 1 + self.number_of_joints()],
             ]
         )
 
@@ -424,9 +422,7 @@ class KynDynParameters(JaxsimDataclass):
         # Note that here we include also the index 0 since suc_H_child[0] stores the
         # optional pose of the base link w.r.t. the root frame of the model.
         # This is supported by SDF when the base link <pose> element is defined.
-        suc_H_i = jax.vmap(lambda i: self.joint_model.successor_H_child(joint_index=i))(
-            jnp.arange(0, 1 + self.number_of_joints())
-        )
+        suc_H_i = self.joint_model.suc_H_i[jnp.arange(0, 1 + self.number_of_joints())]
 
         # Compute the overall transforms from the parent to the child of each joint by
         # composing all the components of our joint model.
@@ -757,6 +753,13 @@ class ContactParameters(JaxsimDataclass):
 
     point: jtp.Matrix = dataclasses.field(default_factory=lambda: jnp.array([]))
 
+    enabled: Static[tuple[bool, ...]] = dataclasses.field(default_factory=tuple)
+
+    @property
+    def indices_of_enabled_collidable_points(self) -> npt.NDArray:
+
+        return np.where(np.array(self.enabled))[0]
+
     @staticmethod
     def build_from(model_description: ModelDescription) -> ContactParameters:
         """
@@ -789,7 +792,11 @@ class ContactParameters(JaxsimDataclass):
         )
 
         # Build the ContactParameters object.
-        cp = ContactParameters(point=points, body=link_index_of_points)
+        cp = ContactParameters(
+            point=points,
+            body=link_index_of_points,
+            enabled=tuple(True for _ in link_index_of_points),
+        )
 
         assert cp.point.shape[1] == 3, cp.point.shape[1]
         assert cp.point.shape[0] == len(cp.body), cp.point.shape[0]
@@ -816,7 +823,7 @@ class FrameParameters(JaxsimDataclass):
 
     name: Static[tuple[str, ...]] = dataclasses.field(default_factory=tuple)
 
-    body: jtp.Vector = dataclasses.field(default_factory=lambda: jnp.array([]))
+    body: Static[tuple[int, ...]] = dataclasses.field(default_factory=tuple)
 
     transform: jtp.Array = dataclasses.field(default_factory=lambda: jnp.array([]))
 
@@ -853,7 +860,7 @@ class FrameParameters(JaxsimDataclass):
         fp = FrameParameters(
             name=names,
             transform=transforms.astype(float),
-            body=jnp.array(parent_link_index_of_frames).astype(int),
+            body=parent_link_index_of_frames,
         )
 
         assert fp.transform.shape[1:] == (4, 4), fp.transform.shape[1:]

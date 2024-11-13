@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Sequence
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.spatial.transform
 import jax_dataclasses
-import jaxlie
 
 import jaxsim.api as js
+import jaxsim.math
 import jaxsim.rbda
 import jaxsim.typing as jtp
-from jaxsim.math import Quaternion
-from jaxsim.rbda.contacts.soft import SoftContacts
 from jaxsim.utils import Mutability
 from jaxsim.utils.tracing import not_tracing
 
@@ -35,13 +34,9 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
 
     state: ODEState
 
-    gravity: jtp.Array
+    gravity: jtp.Vector
 
-    contacts_params: jaxsim.rbda.ContactsParams = dataclasses.field(repr=False)
-
-    time_ns: jtp.Int = dataclasses.field(
-        default_factory=lambda: jnp.array(0, dtype=jnp.uint64)
-    )
+    contacts_params: jaxsim.rbda.contacts.ContactsParams = dataclasses.field(repr=False)
 
     def __hash__(self) -> int:
 
@@ -51,7 +46,6 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
             (
                 hash(self.state),
                 HashedNumpyArray.hash_of_array(self.gravity),
-                HashedNumpyArray.hash_of_array(self.time_ns),
                 hash(self.contacts_params),
             )
         )
@@ -105,17 +99,16 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
     @staticmethod
     def build(
         model: js.model.JaxSimModel,
-        base_position: jtp.Vector | None = None,
-        base_quaternion: jtp.Vector | None = None,
-        joint_positions: jtp.Vector | None = None,
-        base_linear_velocity: jtp.Vector | None = None,
-        base_angular_velocity: jtp.Vector | None = None,
-        joint_velocities: jtp.Vector | None = None,
+        base_position: jtp.VectorLike | None = None,
+        base_quaternion: jtp.VectorLike | None = None,
+        joint_positions: jtp.VectorLike | None = None,
+        base_linear_velocity: jtp.VectorLike | None = None,
+        base_angular_velocity: jtp.VectorLike | None = None,
+        joint_velocities: jtp.VectorLike | None = None,
         standard_gravity: jtp.FloatLike = jaxsim.math.StandardGravity,
-        contact: jaxsim.rbda.ContactsState | None = None,
-        contacts_params: jaxsim.rbda.ContactsParams | None = None,
+        contacts_params: jaxsim.rbda.contacts.ContactsParams | None = None,
         velocity_representation: VelRepr = VelRepr.Inertial,
-        time: jtp.FloatLike | None = None,
+        extended_ode_state: dict[str, jtp.PyTree] | None = None,
     ) -> JaxSimModelData:
         """
         Create a `JaxSimModelData` object with the given state.
@@ -131,100 +124,117 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
                 The base angular velocity in the selected representation.
             joint_velocities: The joint velocities.
             standard_gravity: The standard gravity constant.
-            contact: The state of the soft contacts.
             contacts_params: The parameters of the soft contacts.
             velocity_representation: The velocity representation to use.
-            time: The time at which the state is created.
+            extended_ode_state:
+                Additional user-defined state variables that are not part of the
+                standard `ODEState` object. Useful to extend the system dynamics
+                considered by default in JaxSim.
 
         Returns:
-            A `JaxSimModelData` object with the given state.
+            A `JaxSimModelData` initialized with the given state.
         """
 
         base_position = jnp.array(
-            base_position if base_position is not None else jnp.zeros(3)
+            base_position if base_position is not None else jnp.zeros(3),
+            dtype=float,
         ).squeeze()
 
         base_quaternion = jnp.array(
-            base_quaternion
-            if base_quaternion is not None
-            else jnp.array([1.0, 0, 0, 0])
+            (
+                base_quaternion
+                if base_quaternion is not None
+                else jnp.array([1.0, 0, 0, 0])
+            ),
+            dtype=float,
         ).squeeze()
 
         base_linear_velocity = jnp.array(
-            base_linear_velocity if base_linear_velocity is not None else jnp.zeros(3)
+            base_linear_velocity if base_linear_velocity is not None else jnp.zeros(3),
+            dtype=float,
         ).squeeze()
 
         base_angular_velocity = jnp.array(
-            base_angular_velocity if base_angular_velocity is not None else jnp.zeros(3)
+            (
+                base_angular_velocity
+                if base_angular_velocity is not None
+                else jnp.zeros(3)
+            ),
+            dtype=float,
         ).squeeze()
 
         gravity = jnp.zeros(3).at[2].set(-standard_gravity)
 
         joint_positions = jnp.atleast_1d(
-            joint_positions.squeeze()
-            if joint_positions is not None
-            else jnp.zeros(model.dofs())
+            jnp.array(
+                (
+                    joint_positions
+                    if joint_positions is not None
+                    else jnp.zeros(model.dofs())
+                ),
+                dtype=float,
+            ).squeeze()
         )
 
         joint_velocities = jnp.atleast_1d(
-            joint_velocities.squeeze()
-            if joint_velocities is not None
-            else jnp.zeros(model.dofs())
+            jnp.array(
+                (
+                    joint_velocities
+                    if joint_velocities is not None
+                    else jnp.zeros(model.dofs())
+                ),
+                dtype=float,
+            ).squeeze()
         )
 
-        time_ns = (
-            jnp.array(time * 1e9, dtype=jnp.uint64)
-            if time is not None
-            else jnp.array(0, dtype=jnp.uint64)
+        W_H_B = jaxsim.math.Transform.from_quaternion_and_translation(
+            translation=base_position, quaternion=base_quaternion
         )
-
-        if isinstance(model.contact_model, SoftContacts):
-            contacts_params = (
-                contacts_params
-                if contacts_params is not None
-                else js.contact.estimate_good_soft_contacts_parameters(
-                    model=model, standard_gravity=standard_gravity
-                )
-            )
-        else:
-            contacts_params = model.contact_model.parameters
-
-        W_H_B = jaxlie.SE3.from_rotation_and_translation(
-            translation=base_position,
-            rotation=jaxlie.SO3.from_quaternion_xyzw(
-                base_quaternion[jnp.array([1, 2, 3, 0])]
-            ),
-        ).as_matrix()
 
         v_WB = JaxSimModelData.other_representation_to_inertial(
             array=jnp.hstack([base_linear_velocity, base_angular_velocity]),
             other_representation=velocity_representation,
             transform=W_H_B,
             is_force=False,
-        )
+        ).astype(float)
 
         ode_state = ODEState.build_from_jaxsim_model(
             model=model,
-            base_position=base_position.astype(float),
-            base_quaternion=base_quaternion.astype(float),
-            joint_positions=joint_positions.astype(float),
-            base_linear_velocity=v_WB[0:3].astype(float),
-            base_angular_velocity=v_WB[3:6].astype(float),
-            joint_velocities=joint_velocities.astype(float),
-            tangential_deformation=(
-                contact.tangential_deformation
-                if contact is not None and isinstance(model.contact_model, SoftContacts)
-                else None
-            ),
+            base_position=base_position,
+            base_quaternion=base_quaternion,
+            joint_positions=joint_positions,
+            base_linear_velocity=v_WB[0:3],
+            base_angular_velocity=v_WB[3:6],
+            joint_velocities=joint_velocities,
+            # Unpack all the additional ODE states. If the contact model requires an
+            # additional state that is not explicitly passed to this builder, ODEState
+            # automatically populates that state with zeroed variables.
+            # This is not true for any other custom state that the user might want to
+            # pass to the integrator.
+            **(extended_ode_state if extended_ode_state else {}),
         )
 
         if not ode_state.valid(model=model):
             raise ValueError(ode_state)
 
+        if contacts_params is None:
+
+            if isinstance(
+                model.contact_model,
+                jaxsim.rbda.contacts.SoftContacts
+                | jaxsim.rbda.contacts.ViscoElasticContacts,
+            ):
+
+                contacts_params = js.contact.estimate_good_contact_parameters(
+                    model=model, standard_gravity=standard_gravity
+                )
+
+            else:
+                contacts_params = model.contact_model.parameters
+
         return JaxSimModelData(
-            time_ns=time_ns,
             state=ode_state,
-            gravity=gravity.astype(float),
+            gravity=gravity,
             contacts_params=contacts_params,
             velocity_representation=velocity_representation,
         )
@@ -232,16 +242,6 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
     # ==================
     # Extract quantities
     # ==================
-
-    def time(self) -> jtp.Float:
-        """
-        Get the simulated time.
-
-        Returns:
-            The simulated time in seconds.
-        """
-
-        return self.time_ns.astype(float) / 1e9
 
     def standard_gravity(self) -> jtp.Float:
         """
@@ -292,11 +292,13 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
             msg = "The data object is not compatible with the provided model"
             raise ValueError(msg)
 
-        joint_names = joint_names if joint_names is not None else model.joint_names()
-
-        return self.state.physics_model.joint_positions[
+        joint_idxs = (
             js.joint.names_to_idxs(joint_names=joint_names, model=model)
-        ]
+            if joint_names is not None
+            else jnp.arange(model.number_of_joints())
+        )
+
+        return self.state.physics_model.joint_positions[joint_idxs]
 
     @functools.partial(jax.jit, static_argnames=["joint_names"])
     def joint_velocities(
@@ -337,11 +339,13 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
             msg = "The data object is not compatible with the provided model"
             raise ValueError(msg)
 
-        joint_names = joint_names if joint_names is not None else model.joint_names()
-
-        return self.state.physics_model.joint_velocities[
+        joint_idxs = (
             js.joint.names_to_idxs(joint_names=joint_names, model=model)
-        ]
+            if joint_names is not None
+            else jnp.arange(model.number_of_joints())
+        )
+
+        return self.state.physics_model.joint_velocities[joint_idxs]
 
     @jax.jit
     def base_position(self) -> jtp.Vector:
@@ -374,19 +378,13 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
         # we introduce a Baumgarte stabilization to let the quaternion converge to
         # a unit quaternion. In this case, it is not guaranteed that the quaternion
         # stored in the state is a unit quaternion.
-        W_Q_B = jax.lax.select(
-            pred=jnp.allclose(jnp.linalg.norm(W_Q_B), 1.0, atol=1e-6, rtol=0.0),
-            on_true=W_Q_B,
-            on_false=W_Q_B / jnp.linalg.norm(W_Q_B),
+        W_Q_B = jnp.where(
+            jnp.allclose(W_Q_B.dot(W_Q_B), 1.0), W_Q_B, W_Q_B / jnp.linalg.norm(W_Q_B)
         )
 
-        return (
-            W_Q_B
-            if not dcm
-            else jaxlie.SO3.from_quaternion_xyzw(
-                Quaternion.to_xyzw(wxyz=W_Q_B)
-            ).as_matrix()
-        ).astype(float)
+        return (W_Q_B if not dcm else jaxsim.math.Quaternion.to_dcm(W_Q_B)).astype(
+            float
+        )
 
     @jax.jit
     def base_transform(self) -> jtp.Matrix:
@@ -506,12 +504,14 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
             msg = "The data object is not compatible with the provided model"
             raise ValueError(msg)
 
-        joint_names = joint_names if joint_names is not None else model.joint_names()
+        joint_idxs = (
+            js.joint.names_to_idxs(joint_names=joint_names, model=model)
+            if joint_names is not None
+            else jnp.arange(model.number_of_joints())
+        )
 
         return replace(
-            s=self.state.physics_model.joint_positions.at[
-                js.joint.names_to_idxs(joint_names=joint_names, model=model)
-            ].set(positions)
+            s=self.state.physics_model.joint_positions.at[joint_idxs].set(positions)
         )
 
     @functools.partial(jax.jit, static_argnames=["joint_names"])
@@ -552,12 +552,14 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
             msg = "The data object is not compatible with the provided model"
             raise ValueError(msg)
 
-        joint_names = joint_names if joint_names is not None else model.joint_names()
+        joint_idxs = (
+            js.joint.names_to_idxs(joint_names=joint_names, model=model)
+            if joint_names is not None
+            else jnp.arange(model.number_of_joints())
+        )
 
         return replace(
-            ṡ=self.state.physics_model.joint_velocities.at[
-                js.joint.names_to_idxs(joint_names=joint_names, model=model)
-            ].set(velocities)
+            ṡ=self.state.physics_model.joint_velocities.at[joint_idxs].set(velocities)
         )
 
     @jax.jit
@@ -595,16 +597,18 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
             The updated `JaxSimModelData` object.
         """
 
-        base_quaternion = jnp.array(base_quaternion)
+        W_Q_B = jnp.array(base_quaternion, dtype=float)
+
+        W_Q_B = jax.lax.select(
+            pred=jnp.allclose(jnp.linalg.norm(W_Q_B), 1.0, atol=1e-6, rtol=0.0),
+            on_true=W_Q_B,
+            on_false=W_Q_B / jnp.linalg.norm(W_Q_B),
+        )
 
         return self.replace(
             validate=True,
             state=self.state.replace(
-                physics_model=self.state.physics_model.replace(
-                    base_quaternion=jnp.atleast_1d(base_quaternion.squeeze()).astype(
-                        float
-                    )
-                )
+                physics_model=self.state.physics_model.replace(base_quaternion=W_Q_B)
             ),
         )
 
@@ -737,6 +741,7 @@ class JaxSimModelData(common.ModelDataWithVelocityRepresentation):
         )
 
 
+@functools.partial(jax.jit, static_argnames=["velocity_representation", "base_rpy_seq"])
 def random_model_data(
     model: js.model.JaxSimModel,
     *,
@@ -746,6 +751,18 @@ def random_model_data(
         jtp.FloatLike | Sequence[jtp.FloatLike],
         jtp.FloatLike | Sequence[jtp.FloatLike],
     ] = ((-1, -1, 0.5), 1.0),
+    base_rpy_bounds: tuple[
+        jtp.FloatLike | Sequence[jtp.FloatLike],
+        jtp.FloatLike | Sequence[jtp.FloatLike],
+    ] = (-jnp.pi, jnp.pi),
+    base_rpy_seq: str = "XYZ",
+    joint_pos_bounds: (
+        tuple[
+            jtp.FloatLike | Sequence[jtp.FloatLike],
+            jtp.FloatLike | Sequence[jtp.FloatLike],
+        ]
+        | None
+    ) = None,
     base_vel_lin_bounds: tuple[
         jtp.FloatLike | Sequence[jtp.FloatLike],
         jtp.FloatLike | Sequence[jtp.FloatLike],
@@ -771,6 +788,12 @@ def random_model_data(
         key: The random key.
         velocity_representation: The velocity representation to use.
         base_pos_bounds: The bounds for the base position.
+        base_rpy_bounds:
+            The bounds for the euler angles used to build the base orientation.
+        base_rpy_seq:
+            The sequence of axes for rotation (using `Rotation` from scipy).
+        joint_pos_bounds:
+            The bounds for the joint positions (reading the joint limits if None).
         base_vel_lin_bounds: The bounds for the base linear velocity.
         base_vel_ang_bounds: The bounds for the base angular velocity.
         joint_vel_bounds: The bounds for the joint velocities.
@@ -785,6 +808,8 @@ def random_model_data(
 
     p_min = jnp.array(base_pos_bounds[0], dtype=float)
     p_max = jnp.array(base_pos_bounds[1], dtype=float)
+    rpy_min = jnp.array(base_rpy_bounds[0], dtype=float)
+    rpy_max = jnp.array(base_rpy_bounds[1], dtype=float)
     v_min = jnp.array(base_vel_lin_bounds[0], dtype=float)
     v_max = jnp.array(base_vel_lin_bounds[1], dtype=float)
     ω_min = jnp.array(base_vel_ang_bounds[0], dtype=float)
@@ -810,13 +835,29 @@ def random_model_data(
             key=k1, shape=(3,), minval=p_min, maxval=p_max
         )
 
-        physics_model_state.base_quaternion = jaxlie.SO3.from_rpy_radians(
-            *jax.random.uniform(key=k2, shape=(3,), minval=0, maxval=2 * jnp.pi)
-        ).wxyz
+        physics_model_state.base_quaternion = jaxsim.math.Quaternion.to_wxyz(
+            xyzw=jax.scipy.spatial.transform.Rotation.from_euler(
+                seq=base_rpy_seq,
+                angles=jax.random.uniform(
+                    key=k2, shape=(3,), minval=rpy_min, maxval=rpy_max
+                ),
+            ).as_quat()
+        )
 
         if model.number_of_joints() > 0:
-            physics_model_state.joint_positions = js.joint.random_joint_positions(
-                model=model, key=k3
+
+            s_min, s_max = (
+                jnp.array(joint_pos_bounds, dtype=float)
+                if joint_pos_bounds is not None
+                else (None, None)
+            )
+
+            physics_model_state.joint_positions = (
+                js.joint.random_joint_positions(model=model, key=k3)
+                if (s_min is None or s_max is None)
+                else jax.random.uniform(
+                    key=k3, shape=(model.dofs(),), minval=s_min, maxval=s_max
+                )
             )
 
             physics_model_state.joint_velocities = jax.random.uniform(

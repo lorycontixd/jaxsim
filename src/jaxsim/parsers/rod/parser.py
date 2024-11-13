@@ -1,6 +1,7 @@
 import dataclasses
+import os
 import pathlib
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -23,17 +24,17 @@ class SDFData(NamedTuple):
     fixed_base: bool
     base_link_name: str
 
-    link_descriptions: List[descriptions.LinkDescription]
-    joint_descriptions: List[descriptions.JointDescription]
-    frame_descriptions: List[descriptions.LinkDescription]
-    collision_shapes: List[descriptions.CollisionShape]
+    link_descriptions: list[descriptions.LinkDescription]
+    joint_descriptions: list[descriptions.JointDescription]
+    frame_descriptions: list[descriptions.LinkDescription]
+    collision_shapes: list[descriptions.CollisionShape]
 
     sdf_model: rod.Model | None = None
     model_pose: kinematic_graph.RootPose = kinematic_graph.RootPose()
 
 
 def extract_model_data(
-    model_description: Union[pathlib.Path, str, rod.Model],
+    model_description: pathlib.Path | str | rod.Model | rod.Sdf,
     model_name: str | None = None,
     is_urdf: bool | None = None,
 ) -> SDFData:
@@ -41,30 +42,37 @@ def extract_model_data(
     Extract data from an SDF/URDF resource useful to build a JaxSim model.
 
     Args:
-        model_description: A path to an SDF/URDF file, a string containing its content,
-          or a pre-parsed/pre-built rod model.
+        model_description:
+            A path to an SDF/URDF file, a string containing its content, or
+            a pre-parsed/pre-built rod model.
         model_name: The name of the model to extract from the SDF resource.
-        is_urdf: Whether the SDF resource is a URDF file. Needed only if model_description
-            is a URDF string.
+        is_urdf:
+            Whether to force parsing the resource as a URDF file. Automatically
+            detected if not provided.
 
     Returns:
         The extracted model data.
     """
 
-    if isinstance(model_description, rod.Model):
-        sdf_model = model_description
-    else:
-        # Parse the SDF resource.
-        sdf_element = rod.Sdf.load(sdf=model_description, is_urdf=is_urdf)
+    match model_description:
+        case rod.Model():
+            sdf_model = model_description
+        case rod.Sdf() | str() | pathlib.Path():
+            sdf_element = (
+                model_description
+                if isinstance(model_description, rod.Sdf)
+                else rod.Sdf.load(sdf=model_description, is_urdf=is_urdf)
+            )
+            if not sdf_element.models():
+                raise RuntimeError("Failed to find any model in SDF resource")
 
-        if len(sdf_element.models()) == 0:
-            raise RuntimeError("Failed to find any model in SDF resource")
-
-        # Assume the SDF resource has only one model, or the desired model name is given.
-        sdf_models = {m.name: m for m in sdf_element.models()}
-        sdf_model = (
-            sdf_element.models()[0] if len(sdf_models) == 1 else sdf_models[model_name]
-        )
+            # Assume the SDF resource has only one model, or the desired model name is given.
+            sdf_models = {m.name: m for m in sdf_element.models()}
+            sdf_model = (
+                sdf_element.models()[0]
+                if len(sdf_models) == 1
+                else sdf_models[model_name]
+            )
 
     # Log model name.
     logging.debug(msg=f"Found model '{sdf_model.name}' in SDF resource")
@@ -105,7 +113,7 @@ def extract_model_data(
     links = [
         descriptions.LinkDescription(
             name=l.name,
-            mass=jnp.float32(l.inertial.mass),
+            mass=float(l.inertial.mass),
             inertia=utils.from_sdf_inertial(inertial=l.inertial),
             pose=l.pose.transform() if l.pose is not None else np.eye(4),
         )
@@ -114,7 +122,7 @@ def extract_model_data(
     ]
 
     # Create a dictionary to find easily links.
-    links_dict: Dict[str, descriptions.LinkDescription] = {l.name: l for l in links}
+    links_dict: dict[str, descriptions.LinkDescription] = {l.name: l for l in links}
 
     # ============
     # Parse frames
@@ -223,7 +231,7 @@ def extract_model_data(
             child=links_dict[j.child],
             jtype=utils.joint_to_joint_type(joint=j),
             axis=(
-                np.array(j.axis.xyz.xyz)
+                np.array(j.axis.xyz.xyz, dtype=float)
                 if j.axis is not None
                 and j.axis.xyz is not None
                 and j.axis.xyz.xyz is not None
@@ -232,48 +240,52 @@ def extract_model_data(
             pose=j.pose.transform() if j.pose is not None else np.eye(4),
             initial_position=0.0,
             position_limit=(
-                (
-                    float(j.axis.limit.lower)
-                    if j.axis is not None and j.axis.limit is not None
-                    else np.finfo(float).min
+                float(
+                    j.axis.limit.lower
+                    if j.axis is not None
+                    and j.axis.limit is not None
+                    and j.axis.limit.lower is not None
+                    else jnp.finfo(float).min
                 ),
-                (
-                    float(j.axis.limit.upper)
-                    if j.axis is not None and j.axis.limit is not None
-                    else np.finfo(float).max
+                float(
+                    j.axis.limit.upper
+                    if j.axis is not None
+                    and j.axis.limit is not None
+                    and j.axis.limit.upper is not None
+                    else jnp.finfo(float).max
                 ),
             ),
-            friction_static=(
+            friction_static=float(
                 j.axis.dynamics.friction
                 if j.axis is not None
                 and j.axis.dynamics is not None
                 and j.axis.dynamics.friction is not None
                 else 0.0
             ),
-            friction_viscous=(
+            friction_viscous=float(
                 j.axis.dynamics.damping
                 if j.axis is not None
                 and j.axis.dynamics is not None
                 and j.axis.dynamics.damping is not None
                 else 0.0
             ),
-            position_limit_damper=(
+            position_limit_damper=float(
                 j.axis.limit.dissipation
                 if j.axis is not None
                 and j.axis.limit is not None
                 and j.axis.limit.dissipation is not None
-                else 0.0
+                else os.environ.get("JAXSIM_JOINT_POSITION_LIMIT_DAMPER", 0.0)
             ),
-            position_limit_spring=(
+            position_limit_spring=float(
                 j.axis.limit.stiffness
                 if j.axis is not None
                 and j.axis.limit is not None
                 and j.axis.limit.stiffness is not None
-                else 0.0
+                else os.environ.get("JAXSIM_JOINT_POSITION_LIMIT_SPRING", 0.0)
             ),
         )
         for j in sdf_model.joints()
-        if j.type in {"revolute", "prismatic", "fixed"}
+        if j.type in {"revolute", "continuous", "prismatic", "fixed"}
         and j.parent != "world"
         and j.child in links_dict.keys()
     ]
@@ -304,7 +316,7 @@ def extract_model_data(
     # ================
 
     # Initialize the collision shapes
-    collisions: List[descriptions.CollisionShape] = []
+    collisions: list[descriptions.CollisionShape] = []
 
     # Parse the collisions
     for link in sdf_model.links():
@@ -339,8 +351,8 @@ def extract_model_data(
 
 
 def build_model_description(
-    model_description: Union[pathlib.Path, str, rod.Model],
-    is_urdf: Optional[bool] = False,
+    model_description: pathlib.Path | str | rod.Model,
+    is_urdf: bool | None = None,
 ) -> descriptions.ModelDescription:
     """
     Builds a model description from an SDF/URDF resource.
@@ -348,8 +360,9 @@ def build_model_description(
     Args:
         model_description: A path to an SDF/URDF file, a string containing its content,
           or a pre-parsed/pre-built rod model.
-        is_urdf: Whether the SDF resource is a URDF file. Needed only if model_description
-            is a URDF string.
+        is_urdf: Whether the force parsing the resource as a URDF file. Automatically
+            detected if not provided.
+
     Returns:
         The parsed model description.
     """

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
+
+import jax
 import jax.numpy as jnp
 import jax_dataclasses
 
 import jaxsim.api as js
 import jaxsim.typing as jtp
-from jaxsim.rbda import ContactsState
-from jaxsim.rbda.contacts.soft import SoftContacts, SoftContactsState
 from jaxsim.utils import JaxsimDataclass
 
 # =============================================================================
@@ -31,16 +32,16 @@ class ODEInput(JaxsimDataclass):
     @staticmethod
     def build_from_jaxsim_model(
         model: js.model.JaxSimModel | None = None,
-        joint_forces: jtp.VectorLike | None = None,
         link_forces: jtp.MatrixLike | None = None,
+        joint_force_references: jtp.VectorLike | None = None,
     ) -> ODEInput:
         """
         Build an `ODEInput` from a `JaxSimModel`.
 
         Args:
             model: The `JaxSimModel` associated with the ODE input.
-            joint_forces: The vector of joint forces.
             link_forces: The matrix of external forces applied to the links.
+            joint_force_references: The vector of joint force references.
 
         Returns:
             The `ODEInput` built from the `JaxSimModel`.
@@ -53,8 +54,8 @@ class ODEInput(JaxsimDataclass):
         return ODEInput.build(
             physics_model_input=PhysicsModelInput.build_from_jaxsim_model(
                 model=model,
-                joint_forces=joint_forces,
                 link_forces=link_forces,
+                joint_force_references=joint_force_references,
             ),
             model=model,
         )
@@ -118,22 +119,25 @@ class ODEState(JaxsimDataclass):
 
     Attributes:
         physics_model: The state of the physics model.
-        contact: The state of the contacts model.
+        extended:
+            Additional state variables extending the state vector corresponding to
+            equations of motion. These extended variables are passed to the integrator.
     """
 
     physics_model: PhysicsModelState
-    contact: ContactsState
+
+    extended: dict[str, jtp.PyTree] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def build_from_jaxsim_model(
-        model: js.model.JaxSimModel | None = None,
+        model: js.model.JaxSimModel,
         joint_positions: jtp.Vector | None = None,
         joint_velocities: jtp.Vector | None = None,
         base_position: jtp.Vector | None = None,
         base_quaternion: jtp.Vector | None = None,
         base_linear_velocity: jtp.Vector | None = None,
         base_angular_velocity: jtp.Vector | None = None,
-        tangential_deformation: jtp.Matrix | None = None,
+        **kwargs,
     ) -> ODEState:
         """
         Build an `ODEState` from a `JaxSimModel`.
@@ -148,9 +152,15 @@ class ODEState(JaxsimDataclass):
                 The linear velocity of the base link in inertial-fixed representation.
             base_angular_velocity:
                 The angular velocity of the base link in inertial-fixed representation.
-            tangential_deformation:
-                The matrix of 3D tangential material deformations corresponding to
-                each collidable point.
+            kwargs:
+                Additional arguments corresponding variables extending the default
+                state vector of the physics model.
+
+        Note:
+            Kwargs can be used to supply any additional state variables that are passed
+            to the integrator. This is useful to extend the default system dynamics,
+            for example if the contact model requires additional state variables or to
+            simulate additional dynamics like actuators or muscoloskeletal models.
 
         Returns:
             The `ODEState` built from the `JaxSimModel`.
@@ -160,19 +170,11 @@ class ODEState(JaxsimDataclass):
             `JaxSimModel` and initialized to zero.
         """
 
-        # Get the contact model from the `JaxSimModel`.
-        match model.contact_model:
-            case SoftContacts():
-                contact = SoftContactsState.build_from_jaxsim_model(
-                    model=model,
-                    **(
-                        dict(tangential_deformation=tangential_deformation)
-                        if tangential_deformation is not None
-                        else dict()
-                    ),
-                )
-            case _:
-                raise ValueError("Unable to determine contact state class prefix.")
+        # Initialize the extended state with the optional contact state.
+        extended_state = model.contact_model.zero_state_variables(model=model)
+
+        # Override the default extended state with optional kwargs.
+        extended_state |= kwargs
 
         return ODEState.build(
             model=model,
@@ -185,13 +187,13 @@ class ODEState(JaxsimDataclass):
                 base_linear_velocity=base_linear_velocity,
                 base_angular_velocity=base_angular_velocity,
             ),
-            contact=contact,
+            extended_state=extended_state,
         )
 
     @staticmethod
     def build(
         physics_model_state: PhysicsModelState | None = None,
-        contact: ContactsState | None = None,
+        extended_state: dict[str, jtp.PyTree] | None = None,
         model: js.model.JaxSimModel | None = None,
     ) -> ODEState:
         """
@@ -199,58 +201,60 @@ class ODEState(JaxsimDataclass):
 
         Args:
             physics_model_state: The state of the physics model.
-            contact: The state of the contacts model.
+            extended_state: Additional state variables extending the state vector.
             model: The `JaxSimModel` associated with the ODE state.
 
         Returns:
             A `ODEState` instance.
         """
 
+        # Build a zero state for the physics model if not provided.
         physics_model_state = (
             physics_model_state
             if physics_model_state is not None
             else PhysicsModelState.zero(model=model)
         )
 
-        # Get the contact model from the `JaxSimModel`.
-        match contact:
-            case SoftContactsState():
-                pass
-            case None:
-                contact = SoftContactsState.zero(model=model)
-            case _:
-                raise ValueError("Unable to determine contact state class prefix.")
-
-        return ODEState(physics_model=physics_model_state, contact=contact)
+        return ODEState(
+            physics_model=physics_model_state,
+            extended=extended_state,
+        )
 
     @staticmethod
-    def zero(model: js.model.JaxSimModel) -> ODEState:
+    def zero(model: js.model.JaxSimModel, data: js.data.JaxSimModelData) -> ODEState:
         """
-        Build a zero `ODEState` from a `JaxSimModel`.
+        Build a zero `ODEState` corresponding to a `JaxSimModel`.
 
         Args:
-            model: The `JaxSimModel` associated with the ODE state.
+            model: The model to consider.
+            data: The data of the considered model.
 
         Returns:
             A zero `ODEState` instance.
         """
 
-        model_state = ODEState.build(model=model)
+        ode_state = ODEState.build(
+            model=model,
+            extended_state=jax.tree.map(
+                lambda x: jnp.zeros_like(x), data.state.extended
+            ),
+        )
 
-        return model_state
+        return ode_state
 
     def valid(self, model: js.model.JaxSimModel) -> bool:
         """
         Check if the `ODEState` is valid for a given `JaxSimModel`.
 
         Args:
-            model: The `JaxSimModel` to validate the `ODEState` against.
+            model: The model to validate this `ODEState` against.
 
         Returns:
             `True` if the ODE state is valid for the given model, `False` otherwise.
         """
 
-        return self.physics_model.valid(model=model) and self.contact.valid(model=model)
+        # TODO: should we validate the extended state?
+        return self.physics_model.valid(model=model)
 
 
 # ==================================================
@@ -507,16 +511,16 @@ class PhysicsModelInput(JaxsimDataclass):
     @staticmethod
     def build_from_jaxsim_model(
         model: js.model.JaxSimModel | None = None,
-        joint_forces: jtp.VectorLike | None = None,
         link_forces: jtp.MatrixLike | None = None,
+        joint_force_references: jtp.VectorLike | None = None,
     ) -> PhysicsModelInput:
         """
         Build a `PhysicsModelInput` from a `JaxSimModel`.
 
         Args:
             model: The `JaxSimModel` associated with the input.
-            joint_forces: The vector of joint forces.
             link_forces: The matrix of external forces applied to the links.
+            joint_force_references: The vector of joint force references.
 
         Returns:
             A `PhysicsModelInput` instance.
@@ -527,7 +531,7 @@ class PhysicsModelInput(JaxsimDataclass):
         """
 
         return PhysicsModelInput.build(
-            joint_forces=joint_forces,
+            joint_force_references=joint_force_references,
             link_forces=link_forces,
             number_of_dofs=model.dofs(),
             number_of_links=model.number_of_links(),
@@ -535,8 +539,8 @@ class PhysicsModelInput(JaxsimDataclass):
 
     @staticmethod
     def build(
-        joint_forces: jtp.VectorLike | None = None,
         link_forces: jtp.MatrixLike | None = None,
+        joint_force_references: jtp.VectorLike | None = None,
         number_of_dofs: jtp.Int | None = None,
         number_of_links: jtp.Int | None = None,
     ) -> PhysicsModelInput:
@@ -544,8 +548,8 @@ class PhysicsModelInput(JaxsimDataclass):
         Build a `PhysicsModelInput`.
 
         Args:
-            joint_forces: The vector of joint forces.
             link_forces: The matrix of external forces applied to the links.
+            joint_force_references: The vector of joint force references.
             number_of_dofs: The number of degrees of freedom of the model.
             number_of_links: The number of links of the model.
 
@@ -553,19 +557,21 @@ class PhysicsModelInput(JaxsimDataclass):
             A `PhysicsModelInput` instance.
         """
 
-        joint_forces = (
-            joint_forces if joint_forces is not None else jnp.zeros(number_of_dofs)
-        )
+        joint_force_references = jnp.atleast_1d(
+            jnp.array(joint_force_references, dtype=float).squeeze()
+            if joint_force_references is not None
+            else jnp.zeros(number_of_dofs)
+        ).astype(float)
 
-        link_forces = (
-            link_forces
+        link_forces = jnp.atleast_2d(
+            jnp.array(link_forces, dtype=float).squeeze()
             if link_forces is not None
             else jnp.zeros(shape=(number_of_links, 6))
-        )
+        ).astype(float)
 
         return PhysicsModelInput(
-            tau=jnp.array(joint_forces, dtype=float),
-            f_ext=jnp.array(link_forces, dtype=float),
+            tau=joint_force_references,
+            f_ext=link_forces,
         )
 
     @staticmethod

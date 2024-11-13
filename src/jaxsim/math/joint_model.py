@@ -107,7 +107,7 @@ class JointModel:
             λ_H_pre=λ_H_pre,
             suc_H_i=suc_H_i,
             # Static attributes
-            joint_dofs=tuple([base_dofs] + [int(1) for _ in ordered_joints]),
+            joint_dofs=tuple([base_dofs] + [1 for _ in ordered_joints]),
             joint_names=tuple(["world_to_base"] + [j.name for j in ordered_joints]),
             joint_types=tuple([JointType.Fixed] + [j.jtype for j in ordered_joints]),
             joint_axis=tuple(JointGenericAxis(axis=j.axis) for j in ordered_joints),
@@ -254,8 +254,8 @@ def supported_joint_motion(
         # This is a metadata required by only some joint types.
         axis = jnp.array(joint_axis).astype(float).squeeze()
 
-        pre_H_suc = jaxlie.SE3.from_rotation(
-            rotation=jaxlie.SO3.from_matrix(Rotation.from_axis_angle(vector=s * axis))
+        pre_H_suc = jaxlie.SE3.from_matrix(
+            matrix=jnp.eye(4).at[:3, :3].set(Rotation.from_axis_angle(vector=s * axis))
         )
 
         S = jnp.vstack(jnp.hstack([jnp.zeros(3), axis]))

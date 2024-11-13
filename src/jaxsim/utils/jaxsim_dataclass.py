@@ -2,8 +2,8 @@ import abc
 import contextlib
 import dataclasses
 import functools
-from collections.abc import Iterator
-from typing import Any, Callable, ClassVar, Sequence, Type
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, ClassVar
 
 import jax.flatten_util
 import jax_dataclasses
@@ -135,9 +135,10 @@ class JaxsimDataclass(abc.ABC):
         """
 
         return tuple(
-            leaf.shape if hasattr(leaf, "shape") else None
-            for leaf in jax.tree_util.tree_leaves(tree)
-            if hasattr(leaf, "shape")
+            map(
+                lambda leaf: getattr(leaf, "shape", None),
+                jax.tree_util.tree_leaves(tree),
+            )
         )
 
     @staticmethod
@@ -154,9 +155,10 @@ class JaxsimDataclass(abc.ABC):
         """
 
         return tuple(
-            leaf.dtype if hasattr(leaf, "dtype") else None
-            for leaf in jax.tree_util.tree_leaves(tree)
-            if hasattr(leaf, "dtype")
+            map(
+                lambda leaf: getattr(leaf, "dtype", None),
+                jax.tree_util.tree_leaves(tree),
+            )
         )
 
     @staticmethod
@@ -172,9 +174,10 @@ class JaxsimDataclass(abc.ABC):
         """
 
         return tuple(
-            leaf.weak_type if hasattr(leaf, "weak_type") else False
-            for leaf in jax.tree_util.tree_leaves(tree)
-            if hasattr(leaf, "weak_type")
+            map(
+                lambda leaf: getattr(leaf, "weak_type", None),
+                jax.tree_util.tree_leaves(tree),
+            )
         )
 
     @staticmethod
@@ -295,7 +298,7 @@ class JaxsimDataclass(abc.ABC):
         """
 
         # Make a copy calling tree_map.
-        obj = jax.tree_util.tree_map(lambda leaf: leaf, self)
+        obj = jax.tree.map(lambda leaf: leaf, self)
 
         # Make sure that the copied object and all the copied leaves have the same
         # mutability of the original object.
@@ -337,7 +340,7 @@ class JaxsimDataclass(abc.ABC):
         return self.flatten_fn()(self)
 
     @classmethod
-    def flatten_fn(cls: Type[Self]) -> Callable[[Self], jtp.Vector]:
+    def flatten_fn(cls: type[Self]) -> Callable[[Self], jtp.Vector]:
         """
         Return a function to flatten the object into a 1D vector.
 

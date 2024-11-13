@@ -83,24 +83,9 @@ def build_jaxsim_model(
         A JaxSim model built from the provided description.
     """
 
-    is_urdf = None
-
-    # If the provided description is a string, automatically detect if it
-    # contains the content of a URDF or SDF file.
-    if isinstance(model_description, str):
-        if "<robot" in model_description:
-            is_urdf = True
-
-        elif "<sdf>" in model_description:
-            is_urdf = False
-
-        else:
-            is_urdf = None
-
     # Build the JaxSim model.
     model = js.model.JaxSimModel.build_from_model_description(
         model_description=model_description,
-        is_urdf=is_urdf,
     )
 
     return model
@@ -265,6 +250,116 @@ def jaxsim_model_ur10() -> js.model.JaxSimModel:
     return build_jaxsim_model(model_description=model_urdf_path)
 
 
+@pytest.fixture(scope="session")
+def jaxsim_model_single_pendulum() -> js.model.JaxSimModel:
+    """
+    Fixture providing the JaxSim model of a single pendulum.
+    Returns:
+        The JaxSim model of a single pendulum.
+    """
+
+    import numpy as np
+    import rod.builder.primitives
+
+    base_height = 2.15
+    upper_height = 1.0
+
+    # ===================
+    # Create the builders
+    # ===================
+
+    base_builder = rod.builder.primitives.BoxBuilder(
+        name="base",
+        mass=1.0,
+        x=0.15,
+        y=0.15,
+        z=base_height,
+    )
+
+    upper_builder = rod.builder.primitives.BoxBuilder(
+        name="upper",
+        mass=0.5,
+        x=0.15,
+        y=0.15,
+        z=upper_height,
+    )
+
+    # =================
+    # Create the joints
+    # =================
+
+    fixed = rod.Joint(
+        name="fixed_joint",
+        type="fixed",
+        parent="world",
+        child=base_builder.name,
+    )
+
+    pivot = rod.Joint(
+        name="upper_joint",
+        type="continuous",
+        parent=base_builder.name,
+        child=upper_builder.name,
+        axis=rod.Axis(
+            xyz=rod.Xyz([1, 0, 0]),
+            limit=rod.Limit(),
+        ),
+    )
+
+    # ================
+    # Create the links
+    # ================
+
+    base = (
+        base_builder.build_link(
+            name=base_builder.name,
+            pose=rod.builder.primitives.PrimitiveBuilder.build_pose(
+                pos=np.array([0, 0, base_height / 2])
+            ),
+        )
+        .add_inertial()
+        .add_visual()
+        .add_collision()
+        .build()
+    )
+
+    upper_pose = rod.builder.primitives.PrimitiveBuilder.build_pose(
+        pos=np.array([0, 0, upper_height / 2])
+    )
+
+    upper = (
+        upper_builder.build_link(
+            name=upper_builder.name,
+            pose=rod.builder.primitives.PrimitiveBuilder.build_pose(
+                relative_to=base.name, pos=np.array([0, 0, upper_height])
+            ),
+        )
+        .add_inertial(pose=upper_pose)
+        .add_visual(pose=upper_pose)
+        .add_collision(pose=upper_pose)
+        .build()
+    )
+
+    rod_model = rod.Sdf(
+        version="1.10",
+        model=rod.Model(
+            name="single_pendulum",
+            link=[base, upper],
+            joint=[fixed, pivot],
+        ),
+    )
+
+    rod_model.model.resolve_frames()
+
+    urdf_string = rod.urdf.exporter.UrdfExporter.sdf_to_urdf_string(
+        sdf=rod_model.models()[0]
+    )
+
+    model = build_jaxsim_model(model_description=urdf_string)
+
+    return model
+
+
 # ============================
 # Collections of JaxSim models
 # ============================
@@ -295,6 +390,8 @@ def get_jaxsim_model_fixture(
             return request.getfixturevalue(jaxsim_model_ergocub_reduced.__name__)
         case "ur10":
             return request.getfixturevalue(jaxsim_model_ur10.__name__)
+        case "single_pendulum":
+            return request.getfixturevalue(jaxsim_model_single_pendulum.__name__)
         case _:
             raise ValueError(model_name)
 
@@ -386,3 +483,28 @@ def jaxsim_models_fixed_base(request) -> pathlib.Path | str:
 
     model_name: str = request.param
     return get_jaxsim_model_fixture(model_name=model_name, request=request)
+
+
+@pytest.fixture(scope="function")
+def set_jax_32bit(monkeypatch):
+    """
+    Fixture that temporarily sets JAX precision to 32-bit for the duration of the test.
+    """
+
+    del globals()["jaxsim"]
+    del globals()["js"]
+
+    # Temporarily disable x64
+    monkeypatch.setenv("JAX_ENABLE_X64", "0")
+
+
+@pytest.fixture(scope="function")
+def jaxsim_model_box_32bit(set_jax_32bit, request) -> js.model.JaxSimModel:
+    """
+    Fixture providing the JaxSim model of a box with 32-bit precision.
+
+    Returns:
+        The JaxSim model of a box with 32-bit precision.
+    """
+
+    return get_jaxsim_model_fixture(model_name="box", request=request)

@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 import dataclasses
 import pathlib
 import tempfile
 import warnings
+from collections.abc import Sequence
 from typing import Any
 
 import mujoco as mj
+import numpy as np
+import numpy.typing as npt
 import rod.urdf.exporter
 from lxml import etree as ET
+from scipy.spatial.transform import Rotation
 
 
 def load_rod_model(
@@ -19,7 +25,7 @@ def load_rod_model(
 
     Args:
         model_description: The URDF/SDF file or ROD model to load.
-        is_urdf: Whether the model description is a URDF file.
+        is_urdf: Whether to force parsing the model description as a URDF file.
         model_name: The name of the model to load from the resource.
 
     Returns:
@@ -160,7 +166,13 @@ class RodModelToMjcf:
         considered_joints: list[str] | None = None,
         plane_normal: tuple[float, float, float] = (0, 0, 1),
         heightmap: bool | None = None,
-        cameras: list[dict[str, str]] | dict[str, str] | None = None,
+        heightmap_samples_xy: tuple[int, int] = (101, 101),
+        cameras: (
+            MujocoCamera
+            | Sequence[MujocoCamera]
+            | dict[str, str]
+            | Sequence[dict[str, str]]
+        ) = (),
     ) -> tuple[str, dict[str, Any]]:
         """
         Converts a ROD model to a Mujoco MJCF string.
@@ -170,10 +182,11 @@ class RodModelToMjcf:
             considered_joints: The list of joint names to consider in the conversion.
             plane_normal: The normal vector of the plane.
             heightmap: Whether to generate a heightmap.
-            cameras: The list of cameras to add to the scene.
+            heightmap_samples_xy: The number of points in the heightmap grid.
+            cameras: The custom cameras to add to the scene.
 
         Returns:
-            tuple: A tuple containing the MJCF string and the assets dictionary.
+            A tuple containing the MJCF string and the dictionary of assets.
         """
 
         # -------------------------------------
@@ -198,7 +211,7 @@ class RodModelToMjcf:
         joints_dict = {j.name: j for j in rod_model.joints()}
 
         # Convert all the joints not considered to fixed joints.
-        for joint_name in set(j.name for j in rod_model.joints()) - considered_joints:
+        for joint_name in {j.name for j in rod_model.joints()} - considered_joints:
             joints_dict[joint_name].type = "fixed"
 
         # Convert the ROD model to URDF.
@@ -248,7 +261,6 @@ class RodModelToMjcf:
 
         parser = ET.XMLParser(remove_blank_text=True)
         root: ET._Element = ET.fromstring(text=urdf_string.encode(), parser=parser)
-        import numpy as np
 
         # Give a tiny radius to all dummy spheres
         for geometry in root.findall(".//visual/geometry[sphere]"):
@@ -277,10 +289,10 @@ class RodModelToMjcf:
         mj_model = mj.MjModel.from_xml_string(xml=urdf_string, assets=assets)
 
         # Get the joint names.
-        mj_joint_names = set(
+        mj_joint_names = {
             mj.mj_id2name(mj_model, mj.mjtObj.mjOBJ_JOINT, idx)
             for idx in range(mj_model.njnt)
-        )
+        }
 
         # Check that the Mujoco model only has the considered joints.
         if mj_joint_names != considered_joints:
@@ -404,9 +416,11 @@ class RodModelToMjcf:
                 asset_element,
                 "hfield",
                 name="terrain",
-                nrow="100",
-                ncol="100",
-                size="5 5 1 1",
+                nrow=f"{int(heightmap_samples_xy[0])}",
+                ncol=f"{int(heightmap_samples_xy[1])}",
+                # The following 'size' is a placeholder, it is updated dynamically
+                # when a hfield/heightmap is stored into MjData.
+                size="1 1 1 1",
             )
             if heightmap
             else None
@@ -474,13 +488,16 @@ class RodModelToMjcf:
             fovy="60",
         )
 
-        # Add user-defined camera
-        cameras = cameras if cameras is not None else []
-        for camera in cameras if isinstance(cameras, list) else [cameras]:
-            mj_camera = MujocoCamera.build(**camera)
-            _ = ET.SubElement(
-                worldbody_element, "camera", dataclasses.asdict(mj_camera)
+        # Add user-defined camera.
+        for camera in cameras if isinstance(cameras, Sequence) else [cameras]:
+
+            mj_camera = (
+                camera
+                if isinstance(camera, MujocoCamera)
+                else MujocoCamera.build(**camera)
             )
+
+            _ = ET.SubElement(worldbody_element, "camera", mj_camera.asdict())
 
         # ------------------------------------------------
         # Add a light following the  CoM of the first link
@@ -516,7 +533,12 @@ class UrdfToMjcf:
         model_name: str | None = None,
         plane_normal: tuple[float, float, float] = (0, 0, 1),
         heightmap: bool | None = None,
-        cameras: list[dict[str, str]] | dict[str, str] | None = None,
+        cameras: (
+            MujocoCamera
+            | Sequence[MujocoCamera]
+            | dict[str, str]
+            | Sequence[dict[str, str]]
+        ) = (),
     ) -> tuple[str, dict[str, Any]]:
         """
         Converts a URDF file to a Mujoco MJCF string.
@@ -558,7 +580,12 @@ class SdfToMjcf:
         model_name: str | None = None,
         plane_normal: tuple[float, float, float] = (0, 0, 1),
         heightmap: bool | None = None,
-        cameras: list[dict[str, str]] | dict[str, str] | None = None,
+        cameras: (
+            MujocoCamera
+            | Sequence[MujocoCamera]
+            | dict[str, str]
+            | Sequence[dict[str, str]]
+        ) = (),
     ) -> tuple[str, dict[str, Any]]:
         """
         Converts a SDF file to a Mujoco MJCF string.
@@ -594,21 +621,114 @@ class SdfToMjcf:
 
 @dataclasses.dataclass
 class MujocoCamera:
-    name: str
-    mode: str
-    pos: str
-    xyaxes: str
-    fovy: str
+    """
+    Helper class storing parameters of a Mujoco camera.
+
+    Refer to the official documentation for more details:
+    https://mujoco.readthedocs.io/en/stable/XMLreference.html#body-camera
+    """
+
+    mode: str = "fixed"
+
+    target: str | None = None
+    fovy: str = "45"
+    pos: str = "0 0 0"
+
+    quat: str | None = None
+    axisangle: str | None = None
+    xyaxes: str | None = None
+    zaxis: str | None = None
+    euler: str | None = None
+
+    name: str | None = None
 
     @classmethod
-    def build(cls, **kwargs):
+    def build(cls, **kwargs) -> MujocoCamera:
+
         if not all(isinstance(value, str) for value in kwargs.values()):
-            raise ValueError("Values must be strings")
-
-        if len(kwargs["pos"].split()) != 3:
-            raise ValueError("pos must have three values separated by space")
-
-        if len(kwargs["xyaxes"].split()) != 6:
-            raise ValueError("xyaxes must have six values separated by space")
+            raise ValueError(f"Values must be strings: {kwargs}")
 
         return cls(**kwargs)
+
+    @staticmethod
+    def build_from_target_view(
+        camera_name: str,
+        lookat: Sequence[float | int] | npt.NDArray = (0, 0, 0),
+        distance: float | int | npt.NDArray = 3,
+        azimut: float | int | npt.NDArray = 90,
+        elevation: float | int | npt.NDArray = -45,
+        fovy: float | int | npt.NDArray = 45,
+        degrees: bool = True,
+        **kwargs,
+    ) -> MujocoCamera:
+        """
+        Create a custom camera that looks at a target point.
+
+        Note:
+            The choice of the parameters is easier if we imagine to consider a target
+            frame `T` whose origin is located over the lookat point and having the same
+            orientation of the world frame `W`. We also introduce a camera frame `C`
+            whose origin is located over the lower-left corner of the image, and having
+            the x-axis pointing right and the y-axis pointing up in image coordinates.
+            The camera renders what it sees in the -z direction of frame `C`.
+
+        Args:
+            camera_name: The name of the camera.
+            lookat: The target point to look at (origin of `T`).
+            distance:
+                The distance from the target point (displacement between the origins
+                of `T` and `C`).
+            azimut:
+                The rotation around z of the camera. With an angle of 0, the camera
+                would loot at the target point towards the positive x-axis of `T`.
+            elevation:
+                The rotation around the x-axis of the camera frame `C`. Note that if
+                you want to lift the view angle, the elevation is negative.
+            fovy: The field of view of the camera.
+            degrees: Whether the angles are in degrees or radians.
+            **kwargs: Additional camera parameters.
+
+        Returns:
+            The custom camera.
+        """
+
+        # Start from a frame whose origin is located over the lookat point.
+        # We initialize a -90 degrees rotation around the z-axis because due to
+        # the default camera coordinate system (x pointing right, y pointing up).
+        W_H_C = np.eye(4)
+        W_H_C[0:3, 3] = np.array(lookat)
+        W_H_C[0:3, 0:3] = Rotation.from_euler(
+            seq="ZX", angles=[-90, 90], degrees=True
+        ).as_matrix()
+
+        # Process the azimut.
+        R_az = Rotation.from_euler(seq="Y", angles=azimut, degrees=degrees).as_matrix()
+        W_H_C[0:3, 0:3] = W_H_C[0:3, 0:3] @ R_az
+
+        # Process elevation.
+        R_el = Rotation.from_euler(
+            seq="X", angles=elevation, degrees=degrees
+        ).as_matrix()
+        W_H_C[0:3, 0:3] = W_H_C[0:3, 0:3] @ R_el
+
+        # Process distance.
+        tf_distance = np.eye(4)
+        tf_distance[2, 3] = distance
+        W_H_C = W_H_C @ tf_distance
+
+        # Extract the position and the quaternion.
+        p = W_H_C[0:3, 3]
+        Q = Rotation.from_matrix(W_H_C[0:3, 0:3]).as_quat(scalar_first=True)
+
+        return MujocoCamera.build(
+            name=camera_name,
+            mode="fixed",
+            fovy=f"{fovy if degrees else np.rad2deg(fovy)}",
+            pos=" ".join(p.astype(str).tolist()),
+            quat=" ".join(Q.astype(str).tolist()),
+            **kwargs,
+        )
+
+    def asdict(self) -> dict[str, str]:
+
+        return {k: v for k, v in dataclasses.asdict(self).items() if v is not None}

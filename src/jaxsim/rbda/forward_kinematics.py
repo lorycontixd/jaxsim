@@ -4,7 +4,7 @@ import jaxlie
 
 import jaxsim.api as js
 import jaxsim.typing as jtp
-from jaxsim.math import Adjoint, Quaternion
+from jaxsim.math import Adjoint
 
 from . import utils
 
@@ -42,7 +42,7 @@ def forward_kinematics_model(
 
     # Compute the base transform.
     W_H_B = jaxlie.SE3.from_rotation_and_translation(
-        rotation=jaxlie.SO3.from_quaternion_xyzw(xyzw=Quaternion.to_xyzw(wxyz=W_Q_B)),
+        rotation=jaxlie.SO3(wxyz=W_Q_B),
         translation=W_p_B,
     )
 
@@ -75,10 +75,14 @@ def forward_kinematics_model(
 
         return (W_X_i,), None
 
-    (W_X_i,), _ = jax.lax.scan(
-        f=propagate_kinematics,
-        init=propagate_kinematics_carry,
-        xs=jnp.arange(start=1, stop=model.number_of_links()),
+    (W_X_i,), _ = (
+        jax.lax.scan(
+            f=propagate_kinematics,
+            init=propagate_kinematics_carry,
+            xs=jnp.arange(start=1, stop=model.number_of_links()),
+        )
+        if model.number_of_links() > 1
+        else [(W_X_i,), None]
     )
 
     return jax.vmap(Adjoint.to_transform)(W_X_i)

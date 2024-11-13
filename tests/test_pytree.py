@@ -14,14 +14,12 @@ def test_call_jit_compiled_function_passing_different_objects(
 
     # Create a first model from the URDF.
     model1 = js.model.JaxSimModel.build_from_model_description(
-        model_description=ergocub_model_description_path,
-        is_urdf=True,
+        model_description=ergocub_model_description_path
     )
 
     # Create a second model from the URDF.
     model2 = js.model.JaxSimModel.build_from_model_description(
-        model_description=ergocub_model_description_path,
-        is_urdf=True,
+        model_description=ergocub_model_description_path
     )
 
     # The objects should be different, but the comparison should return True.
@@ -31,7 +29,7 @@ def test_call_jit_compiled_function_passing_different_objects(
 
     # If this function has never been compiled by any other test, JAX will
     # jit-compile it here.
-    _ = js.contact.estimate_good_soft_contacts_parameters(model=model1)
+    _ = js.contact.estimate_good_contact_parameters(model=model1)
 
     # Now JAX should not compile it again.
     with jax.log_compiles():
@@ -39,11 +37,11 @@ def test_call_jit_compiled_function_passing_different_objects(
             # Beyond running without any JIT recompilations, the following function
             # should work on different JaxSimModel objects without raising any errors
             # related to the comparison of Static fields.
-            _ = js.contact.estimate_good_soft_contacts_parameters(model=model2)
+            _ = js.contact.estimate_good_contact_parameters(model=model2)
             stdout = buf.getvalue()
 
     assert (
-        f"Compiling {js.contact.estimate_good_soft_contacts_parameters.__name__}"
+        f"Compiling {js.contact.estimate_good_contact_parameters.__name__}"
         not in stdout
     )
 

@@ -8,7 +8,7 @@ import jaxsim.api as js
 import jaxsim.rbda
 import jaxsim.typing as jtp
 from jaxsim import VelRepr
-from jaxsim.rbda.contacts.soft import SoftContacts, SoftContactsParams
+from jaxsim.rbda.contacts import SoftContacts, SoftContactsParams
 
 # All JaxSim algorithms, excluding the variable-step integrators, should support
 # being automatically differentiated until second order, both in FWD and REV modes.
@@ -93,7 +93,7 @@ def test_ad_aba(
     aba = lambda W_p_B, W_Q_B, s, W_v_WB, ṡ, τ, W_f_L, g: jaxsim.rbda.aba(
         model=model,
         base_position=W_p_B,
-        base_quaternion=W_Q_B,
+        base_quaternion=W_Q_B / jnp.linalg.norm(W_Q_B),
         joint_positions=s,
         base_linear_velocity=W_v_WB[0:3],
         base_angular_velocity=W_v_WB[3:6],
@@ -150,7 +150,7 @@ def test_ad_rnea(
     rnea = lambda W_p_B, W_Q_B, s, W_v_WB, ṡ, W_v̇_WB, s̈, W_f_L, g: jaxsim.rbda.rnea(
         model=model,
         base_position=W_p_B,
-        base_quaternion=W_Q_B,
+        base_quaternion=W_Q_B / jnp.linalg.norm(W_Q_B),
         joint_positions=s,
         base_linear_velocity=W_v_WB[0:3],
         base_angular_velocity=W_v_WB[3:6],
@@ -229,7 +229,7 @@ def test_ad_fk(
     fk = lambda W_p_B, W_Q_B, s: jaxsim.rbda.forward_kinematics_model(
         model=model,
         base_position=W_p_B,
-        base_quaternion=W_Q_B,
+        base_quaternion=W_Q_B / jnp.linalg.norm(W_Q_B),
         joint_positions=s,
     )
 
@@ -263,7 +263,7 @@ def test_ad_jacobian(
     # ====
 
     # Get the link indices.
-    link_indices = js.link.names_to_idxs(model=model, link_names=model.link_names())
+    link_indices = jnp.arange(model.number_of_links())
 
     # Get a closure exposing only the parameters to be differentiated.
     # We differentiate the jacobian of the last link, likely among those
@@ -295,7 +295,7 @@ def test_ad_soft_contacts(
     m = jax.random.uniform(subkey3, shape=(3,), minval=-1)
 
     # Get the soft contacts parameters.
-    parameters = js.contact.estimate_good_soft_contacts_parameters(model=model)
+    parameters = js.contact.estimate_good_contact_parameters(model=model)
 
     # ====
     # Test
@@ -308,9 +308,15 @@ def test_ad_soft_contacts(
         m: jtp.VectorLike,
         params: SoftContactsParams,
     ) -> tuple[jtp.Vector, jtp.Vector]:
-        W_f_Ci, (CW_ṁ,) = SoftContacts(parameters=params).compute_contact_forces(
-            position=p, velocity=v, tangential_deformation=m
+
+        W_f_Ci, CW_ṁ = SoftContacts.compute_contact_force(
+            position=p,
+            velocity=v,
+            tangential_deformation=m,
+            parameters=params,
+            terrain=model.terrain,
         )
+
         return W_f_Ci, CW_ṁ
 
     # Check derivatives against finite differences.
@@ -343,7 +349,7 @@ def test_ad_integration(
     s = data.joint_positions(model=model)
     W_v_WB = data.base_velocity()
     ṡ = data.joint_velocities(model=model)
-    m = data.state.contact.tangential_deformation
+    m = data.state.extended["tangential_deformation"]
 
     # Inputs.
     W_f_L = references.link_forces(model=model)
@@ -352,24 +358,6 @@ def test_ad_integration(
     # ====
     # Test
     # ====
-
-    import jaxsim.integrators
-
-    # Note that only fixes-step integrators support both FWD and RWD gradients.
-    # Select a second-order Heun scheme with quaternion integrated on SO(3).
-    # Note that it's always preferable using the SO(3) versions on AD applications so
-    # that the gradient of the integrated dynamics always considers unary quaternions.
-    integrator = jaxsim.integrators.fixed_step.Heun2SO3.build(
-        dynamics=js.ode.wrap_system_dynamics_for_integration(
-            model=model,
-            data=data,
-            system_dynamics=js.ode.system_dynamics,
-        ),
-    )
-
-    # Initialize the integrator.
-    t0, dt = 0.0, 0.001
-    integrator_state = integrator.init(x0=data.state, t0=t0, dt=dt)
 
     # Function exposing only the parameters to be differentiated.
     def step(
@@ -397,17 +385,14 @@ def test_ad_integration(
                     base_angular_velocity=W_v_WB[3:6],
                     joint_velocities=ṡ,
                 ),
-                contact=js.ode_data.SoftContactsState.build(tangential_deformation=m),
+                extended_state={"tangential_deformation": m},
             ),
         )
 
         data_xf, _ = js.model.step(
-            dt=dt,
             model=model,
             data=data_x0,
-            integrator=integrator,
-            integrator_state=integrator_state,
-            joint_forces=τ,
+            joint_force_references=τ,
             link_forces=W_f_L,
         )
 
@@ -416,7 +401,7 @@ def test_ad_integration(
         xf_s = data_xf.joint_positions(model=model)
         xf_W_v_WB = data_xf.base_velocity()
         xf_ṡ = data_xf.joint_velocities(model=model)
-        xf_m = data_xf.state.contact.tangential_deformation
+        xf_m = data_xf.state.extended["tangential_deformation"]
 
         return xf_W_p_B, xf_W_Q_B, xf_s, xf_W_v_WB, xf_ṡ, xf_m
 

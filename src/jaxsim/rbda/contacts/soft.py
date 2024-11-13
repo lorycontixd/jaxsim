@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
 import jax_dataclasses
 
 import jaxsim.api as js
+import jaxsim.math
 import jaxsim.typing as jtp
-from jaxsim.math import Skew, StandardGravity
+from jaxsim import logging
+from jaxsim.math import StandardGravity
 from jaxsim.terrain import FlatTerrain, Terrain
 
-from .common import ContactModel, ContactsParams, ContactsState
+from . import common
+
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 
 @jax_dataclasses.pytree_dataclass
-class SoftContactsParams(ContactsParams):
+class SoftContactsParams(common.ContactsParams):
     """Parameters of the soft contacts model."""
 
     K: jtp.Float = dataclasses.field(
@@ -30,6 +38,14 @@ class SoftContactsParams(ContactsParams):
         default_factory=lambda: jnp.array(0.5, dtype=float)
     )
 
+    p: jtp.Float = dataclasses.field(
+        default_factory=lambda: jnp.array(0.5, dtype=float)
+    )
+
+    q: jtp.Float = dataclasses.field(
+        default_factory=lambda: jnp.array(0.5, dtype=float)
+    )
+
     def __hash__(self) -> int:
 
         from jaxsim.utils.wrappers import HashedNumpyArray
@@ -39,6 +55,8 @@ class SoftContactsParams(ContactsParams):
                 HashedNumpyArray.hash_of_array(self.K),
                 HashedNumpyArray.hash_of_array(self.D),
                 HashedNumpyArray.hash_of_array(self.mu),
+                HashedNumpyArray.hash_of_array(self.p),
+                HashedNumpyArray.hash_of_array(self.q),
             )
         )
 
@@ -49,10 +67,16 @@ class SoftContactsParams(ContactsParams):
 
         return hash(self) == hash(other)
 
-    @staticmethod
+    @classmethod
     def build(
-        K: jtp.FloatLike = 1e6, D: jtp.FloatLike = 2_000, mu: jtp.FloatLike = 0.5
-    ) -> SoftContactsParams:
+        cls: type[Self],
+        *,
+        K: jtp.FloatLike = 1e6,
+        D: jtp.FloatLike = 2_000,
+        mu: jtp.FloatLike = 0.5,
+        p: jtp.FloatLike = 0.5,
+        q: jtp.FloatLike = 0.5,
+    ) -> Self:
         """
         Create a SoftContactsParams instance with specified parameters.
 
@@ -60,6 +84,12 @@ class SoftContactsParams(ContactsParams):
             K: The stiffness parameter.
             D: The damping parameter of the soft contacts model.
             mu: The static friction coefficient.
+            p:
+                The exponent p corresponding to the damping-related non-linearity
+                of the Hunt/Crossley model.
+            q:
+                The exponent q corresponding to the spring-related non-linearity
+                of the Hunt/Crossley model
 
         Returns:
             A SoftContactsParams instance with the specified parameters.
@@ -69,10 +99,13 @@ class SoftContactsParams(ContactsParams):
             K=jnp.array(K, dtype=float),
             D=jnp.array(D, dtype=float),
             mu=jnp.array(mu, dtype=float),
+            p=jnp.array(p, dtype=float),
+            q=jnp.array(q, dtype=float),
         )
 
-    @staticmethod
+    @classmethod
     def build_default_from_jaxsim_model(
+        cls: type[Self],
         model: js.model.JaxSimModel,
         *,
         standard_gravity: jtp.FloatLike = StandardGravity,
@@ -80,6 +113,8 @@ class SoftContactsParams(ContactsParams):
         max_penetration: jtp.FloatLike = 0.001,
         number_of_active_collidable_points_steady_state: jtp.IntLike = 1,
         damping_ratio: jtp.FloatLike = 1.0,
+        p: jtp.FloatLike = 0.5,
+        q: jtp.FloatLike = 0.5,
     ) -> SoftContactsParams:
         """
         Create a SoftContactsParams instance with good default parameters.
@@ -94,6 +129,12 @@ class SoftContactsParams(ContactsParams):
                 The number of contacts supporting the weight of the model
                 in steady state.
             damping_ratio: The ratio controlling the damping behavior.
+            p:
+                The exponent p corresponding to the damping-related non-linearity
+                of the Hunt/Crossley model.
+            q:
+                The exponent q corresponding to the spring-related non-linearity
+                of the Hunt/Crossley model
 
         Returns:
             A `SoftContactsParams` instance with the specified parameters.
@@ -120,15 +161,17 @@ class SoftContactsParams(ContactsParams):
         f_average = m * g / number_of_active_collidable_points_steady_state
 
         # Compute the stiffness to get the desired steady-state penetration.
-        K = f_average / jnp.power(δ_max, 3 / 2)
+        # Note that this is dependent on the non-linear exponent used in
+        # the damping term of the Hunt/Crossley model.
+        K = f_average / jnp.power(δ_max, 1 + p)
 
         # Compute the damping using the damping ratio.
         critical_damping = 2 * jnp.sqrt(K * m)
         D = ξ * critical_damping
 
-        return SoftContactsParams.build(K=K, D=D, mu=μc)
+        return SoftContactsParams.build(K=K, D=D, mu=μc, p=p, q=q)
 
-    def valid(self) -> bool:
+    def valid(self) -> jtp.BoolLike:
         """
         Check if the parameters are valid.
 
@@ -136,322 +179,289 @@ class SoftContactsParams(ContactsParams):
             `True` if the parameters are valid, `False` otherwise.
         """
 
-        return (
-            jnp.all(self.K >= 0.0)
-            and jnp.all(self.D >= 0.0)
-            and jnp.all(self.mu >= 0.0)
-        )
+        return jnp.hstack(
+            [
+                self.K >= 0.0,
+                self.D >= 0.0,
+                self.mu >= 0.0,
+                self.p >= 0.0,
+                self.q >= 0.0,
+            ]
+        ).all()
 
 
 @jax_dataclasses.pytree_dataclass
-class SoftContacts(ContactModel):
+class SoftContacts(common.ContactModel):
     """Soft contacts model."""
 
     parameters: SoftContactsParams = dataclasses.field(
-        default_factory=SoftContactsParams
+        default_factory=SoftContactsParams.build
     )
 
     terrain: jax_dataclasses.Static[Terrain] = dataclasses.field(
-        default_factory=FlatTerrain
+        default_factory=FlatTerrain.build
     )
 
-    def compute_contact_forces(
-        self,
-        position: jtp.Vector,
-        velocity: jtp.Vector,
-        tangential_deformation: jtp.Vector,
-    ) -> tuple[jtp.Vector, tuple[jtp.Vector]]:
+    @classmethod
+    def build(
+        cls: type[Self],
+        parameters: SoftContactsParams | None = None,
+        terrain: Terrain | None = None,
+        model: js.model.JaxSimModel | None = None,
+        **kwargs,
+    ) -> Self:
         """
-        Compute the contact forces and material deformation rate.
+        Create a `SoftContacts` instance with specified parameters.
 
         Args:
-            position: The position of the collidable point.
-            velocity: The linear velocity of the collidable point.
-            tangential_deformation: The tangential deformation.
+            parameters: The parameters of the soft contacts model.
+            terrain: The considered terrain.
+            model:
+                The robot model considered by the contact model.
+                If passed, it is used to estimate good default parameters.
 
         Returns:
-            A tuple containing the contact force and material deformation rate.
+            The `SoftContacts` instance.
         """
 
-        # Short name of parameters
-        K = self.parameters.K
-        D = self.parameters.D
-        μ = self.parameters.mu
+        if len(kwargs) != 0:
+            logging.debug(msg=f"Ignoring extra arguments: {kwargs}")
 
-        # Material 3D tangential deformation and its derivative
-        m = tangential_deformation.squeeze()
-        ṁ = jnp.zeros_like(m)
-
-        # Note: all the small hardcoded tolerances in this method have been introduced
-        # to allow jax differentiating through this algorithm. They should not affect
-        # the accuracy of the simulation, although they might make it less readable.
-
-        # ========================
-        # Normal force computation
-        # ========================
-
-        # Unpack the position of the collidable point.
-        px, py, pz = W_p_C = position.squeeze()
-        vx, vy, vz = W_ṗ_C = velocity.squeeze()
-
-        # Compute the terrain normal and the contact depth.
-        n̂ = self.terrain.normal(x=px, y=py).squeeze()
-        h = jnp.array([0, 0, self.terrain.height(x=px, y=py) - pz])
-
-        # Compute the penetration depth normal to the terrain.
-        δ = jnp.maximum(0.0, jnp.dot(h, n̂))
-
-        # Compute the penetration normal velocity.
-        δ̇ = -jnp.dot(W_ṗ_C, n̂)
-
-        # Non-linear spring-damper model.
-        # This is the force magnitude along the direction normal to the terrain.
-        force_normal_mag = jax.lax.select(
-            pred=δ >= 1e-9,
-            on_true=jnp.sqrt(δ + 1e-12) * (K * δ + D * δ̇),
-            on_false=jnp.array(0.0),
-        )
-
-        # Prevent negative normal forces that might occur when δ̇ is largely negative.
-        force_normal_mag = jnp.maximum(0.0, force_normal_mag)
-
-        # Compute the 3D linear force in C[W] frame.
-        force_normal = force_normal_mag * n̂
-
-        # ====================================
-        # No friction and no tangential forces
-        # ====================================
-
-        # Compute the adjoint C[W]->W for transforming 6D forces from mixed to inertial.
-        # Note: this is equal to the 6D velocities transform: CW_X_W.transpose().
-        W_Xf_CW = jnp.vstack(
-            [
-                jnp.block([jnp.eye(3), jnp.zeros(shape=(3, 3))]),
-                jnp.block([Skew.wedge(W_p_C), jnp.eye(3)]),
-            ]
-        )
-
-        def with_no_friction():
-            # Compute 6D mixed force in C[W].
-            CW_f_lin = force_normal
-            CW_f = jnp.hstack([force_normal, jnp.zeros_like(CW_f_lin)])
-
-            # Compute lin-ang 6D forces (inertial representation).
-            W_f = W_Xf_CW @ CW_f
-
-            return W_f, (ṁ,)
-
-        # =========================
-        # Compute tangential forces
-        # =========================
-
-        def with_friction():
-            # Initialize the tangential deformation rate ṁ.
-            # For inactive contacts with m≠0, this is the dynamics of the material
-            # relaxation converging exponentially to steady state.
-            ṁ = (-K / D) * m
-
-            # Check if the collidable point is below ground.
-            # Note: when δ=0, we consider the point still not it contact such that
-            #       we prevent divisions by 0 in the computations below.
-            active_contact = pz < self.terrain.height(x=px, y=py)
-
-            def above_terrain():
-                return jnp.zeros(6), (ṁ,)
-
-            def below_terrain():
-                # Decompose the velocity in normal and tangential components.
-                v_normal = jnp.dot(W_ṗ_C, n̂) * n̂
-                v_tangential = W_ṗ_C - v_normal
-
-                # Compute the tangential force. If inside the friction cone, the contact.
-                f_tangential = -jnp.sqrt(δ + 1e-12) * (K * m + D * v_tangential)
-
-                def sticking_contact():
-                    # Sum the normal and tangential forces, and create the 6D force.
-                    CW_f_stick = force_normal + f_tangential
-                    CW_f = jnp.hstack([CW_f_stick, jnp.zeros(3)])
-
-                    # In this case the 3D material deformation is the tangential velocity.
-                    ṁ = v_tangential
-
-                    # Return the 6D force in the contact frame and
-                    # the deformation derivative.
-                    return CW_f, ṁ
-
-                def slipping_contact():
-                    # Project the force to the friction cone boundary.
-                    f_tangential_projected = (μ * force_normal_mag) * (
-                        f_tangential / jnp.maximum(jnp.linalg.norm(f_tangential), 1e-9)
-                    )
-
-                    # Sum the normal and tangential forces, and create the 6D force.
-                    CW_f_slip = force_normal + f_tangential_projected
-                    CW_f = jnp.hstack([CW_f_slip, jnp.zeros(3)])
-
-                    # Correct the material deformation derivative for slipping contacts.
-                    # Basically we compute ṁ such that we get `f_tangential` on the cone
-                    # given the current (m, δ).
-                    ε = 1e-9
-                    δε = jnp.maximum(δ, ε)
-                    α = -K * jnp.sqrt(δε)
-                    β = -D * jnp.sqrt(δε)
-                    ṁ = (f_tangential_projected - α * m) / β
-
-                    # Return the 6D force in the contact frame and
-                    # the deformation derivative.
-                    return CW_f, ṁ
-
-                CW_f, ṁ = jax.lax.cond(
-                    pred=f_tangential.dot(f_tangential) > (μ * force_normal_mag) ** 2,
-                    true_fun=lambda _: slipping_contact(),
-                    false_fun=lambda _: sticking_contact(),
-                    operand=None,
-                )
-
-                # Express the 6D force in the world frame.
-                W_f = W_Xf_CW @ CW_f
-
-                # Return the 6D force in the world frame and the deformation derivative.
-                return W_f, (ṁ,)
-
-            # (W_f, (ṁ,))
-            return jax.lax.cond(
-                pred=active_contact,
-                true_fun=lambda _: below_terrain(),
-                false_fun=lambda _: above_terrain(),
-                operand=None,
+        # Build the contact parameters if not provided. Use the model to estimate
+        # good default parameters, if passed. Users can later override these default
+        # parameters with their own values -- possibly tuned better.
+        if parameters is None:
+            parameters = (
+                SoftContactsParams.build_default_from_jaxsim_model(model=model)
+                if model is not None
+                else cls.__dataclass_fields__["parameters"].default_factory()
             )
 
-        # (W_f, (ṁ,))
-        return jax.lax.cond(
-            pred=(μ == 0.0),
-            true_fun=lambda _: with_no_friction(),
-            false_fun=lambda _: with_friction(),
-            operand=None,
-        )
-
-
-@jax_dataclasses.pytree_dataclass
-class SoftContactsState(ContactsState):
-    """
-    Class storing the state of the soft contacts model.
-
-    Attributes:
-        tangential_deformation:
-            The matrix of 3D tangential material deformations corresponding to
-            each collidable point.
-    """
-
-    tangential_deformation: jtp.Matrix
-
-    def __hash__(self) -> int:
-        return hash(
-            tuple(jnp.atleast_1d(self.tangential_deformation.flatten()).tolist())
-        )
-
-    def __eq__(self, other: SoftContactsState) -> bool:
-        if not isinstance(other, SoftContactsState):
-            return False
-
-        return hash(self) == hash(other)
-
-    @staticmethod
-    def build_from_jaxsim_model(
-        model: js.model.JaxSimModel | None = None,
-        tangential_deformation: jtp.Matrix | None = None,
-    ) -> SoftContactsState:
-        """
-        Build a `SoftContactsState` from a `JaxSimModel`.
-
-        Args:
-            model: The `JaxSimModel` associated with the soft contacts state.
-            tangential_deformation: The matrix of 3D tangential material deformations.
-
-        Returns:
-            The `SoftContactsState` built from the `JaxSimModel`.
-
-        Note:
-            If any of the state components are not provided, they are built from the
-            `JaxSimModel` and initialized to zero.
-        """
-
-        return SoftContactsState.build(
-            tangential_deformation=tangential_deformation,
-            number_of_collidable_points=len(
-                model.kin_dyn_parameters.contact_parameters.body
+        return cls(
+            parameters=parameters,
+            terrain=(
+                terrain
+                if terrain is not None
+                else cls.__dataclass_fields__["terrain"].default_factory()
             ),
         )
 
-    @staticmethod
-    def build(
-        tangential_deformation: jtp.Matrix | None = None,
-        number_of_collidable_points: int | None = None,
-    ) -> SoftContactsState:
+    @classmethod
+    def zero_state_variables(cls, model: js.model.JaxSimModel) -> dict[str, jtp.Array]:
         """
-        Create a `SoftContactsState`.
-
-        Args:
-            tangential_deformation:
-                The matrix of 3D tangential material deformations corresponding to
-                each collidable point.
-            number_of_collidable_points: The number of collidable points.
-
-        Returns:
-            A `SoftContactsState` instance.
+        Build zero state variables of the contact model.
         """
 
-        tangential_deformation = (
-            tangential_deformation
-            if tangential_deformation is not None
-            else jnp.zeros(shape=(number_of_collidable_points, 3))
+        # Initialize the material deformation to zero.
+        tangential_deformation = jnp.zeros(
+            shape=(len(model.kin_dyn_parameters.contact_parameters.body), 3),
+            dtype=float,
         )
 
-        if tangential_deformation.shape[1] != 3:
-            raise RuntimeError("The tangential deformation matrix must have 3 columns.")
-
-        if (
-            number_of_collidable_points is not None
-            and tangential_deformation.shape[0] != number_of_collidable_points
-        ):
-            msg = "The number of collidable points must match the number of rows "
-            msg += "in the tangential deformation matrix."
-            raise RuntimeError(msg)
-
-        return SoftContactsState(
-            tangential_deformation=jnp.array(tangential_deformation).astype(float)
-        )
+        return {"tangential_deformation": tangential_deformation}
 
     @staticmethod
-    def zero(model: js.model.JaxSimModel) -> SoftContactsState:
+    @functools.partial(jax.jit, static_argnames=("terrain",))
+    def hunt_crossley_contact_model(
+        position: jtp.VectorLike,
+        velocity: jtp.VectorLike,
+        tangential_deformation: jtp.VectorLike,
+        terrain: Terrain,
+        K: jtp.FloatLike,
+        D: jtp.FloatLike,
+        mu: jtp.FloatLike,
+        p: jtp.FloatLike = 0.5,
+        q: jtp.FloatLike = 0.5,
+    ) -> tuple[jtp.Vector, jtp.Vector]:
+
+        # Convert the input vectors to arrays.
+        W_p_C = jnp.array(position, dtype=float).squeeze()
+        W_ṗ_C = jnp.array(velocity, dtype=float).squeeze()
+        m = jnp.array(tangential_deformation, dtype=float).squeeze()
+
+        # Use symbol for the static friction.
+        μ = mu
+
+        # Compute the penetration depth, its rate, and the considered terrain normal.
+        δ, δ̇, n̂ = common.compute_penetration_data(p=W_p_C, v=W_ṗ_C, terrain=terrain)
+
+        # There are few operations like computing the norm of a vector with zero length
+        # or computing the square root of zero that are problematic in an AD context.
+        # To avoid these issues, we introduce a small tolerance ε to their arguments
+        # and make sure that we do not check them against zero directly.
+        ε = jnp.finfo(float).eps
+
+        # Compute the powers of the penetration depth.
+        # Inject ε to address AD issues in differentiating the square root when
+        #  p and q are fractional.
+        δp = jnp.power(δ + ε, p)
+        δq = jnp.power(δ + ε, q)
+
+        # ========================
+        # Compute the normal force
+        # ========================
+
+        # Non-linear spring-damper model (Hunt/Crossley model).
+        # This is the force magnitude along the direction normal to the terrain.
+        force_normal_mag = (K * δp) * δ + (D * δq) * δ̇
+
+        # Depending on the magnitude of δ̇, the normal force could be negative.
+        force_normal_mag = jnp.maximum(0.0, force_normal_mag)
+
+        # Compute the 3D linear force in C[W] frame.
+        f_normal = force_normal_mag * n̂
+
+        # ============================
+        # Compute the tangential force
+        # ============================
+
+        # Extract the tangential component of the velocity.
+        v_tangential = W_ṗ_C - jnp.dot(W_ṗ_C, n̂) * n̂
+
+        # Extract the normal and tangential components of the material deformation.
+        m_normal = jnp.dot(m, n̂) * n̂
+        m_tangential = m - jnp.dot(m, n̂) * n̂
+
+        # Compute the tangential force in the sticking case.
+        # Using the tangential component of the material deformation should not be
+        # necessary if the sticking-slipping transition occurs in a terrain area
+        # with a locally constant normal. However, this assumption is not true in
+        # general, especially for highly uneven terrains.
+        f_tangential = -((K * δp) * m_tangential + (D * δq) * v_tangential)
+
+        # Detect the contact type (sticking or slipping).
+        # Note that if there is no contact, sticking is set to True, and this detail
+        # is exploited in the computation of the `contact_status` variable.
+        sticking = jnp.logical_or(
+            δ <= 0, f_tangential.dot(f_tangential) <= (μ * force_normal_mag) ** 2
+        )
+
+        # Compute the direction of the tangential force.
+        # To prevent dividing by zero, we use a switch statement.
+        # The ε, instead, is needed to make AD happy.
+        f_tangential_direction = jnp.where(
+            f_tangential.dot(f_tangential) != 0,
+            f_tangential / jnp.linalg.norm(f_tangential + ε),
+            jnp.zeros(3),
+        )
+
+        # Project the tangential force to the friction cone if slipping.
+        f_tangential = jnp.where(
+            sticking,
+            f_tangential,
+            jnp.minimum(μ * force_normal_mag, jnp.linalg.norm(f_tangential + ε))
+            * f_tangential_direction,
+        )
+
+        # Set the tangential force to zero if there is no contact.
+        f_tangential = jnp.where(δ <= 0, jnp.zeros(3), f_tangential)
+
+        # =====================================
+        # Compute the material deformation rate
+        # =====================================
+
+        # Compute the derivative of the material deformation.
+        # Note that we included an additional relaxation of `m_normal` in the
+        # sticking case, so that the normal deformation that could have accumulated
+        # from a previous slipping phase can relax to zero.
+        ṁ_no_contact = -(K / D) * m
+        ṁ_sticking = v_tangential - (K / D) * m_normal
+        ṁ_slipping = -(f_tangential + (K * δp) * m_tangential) / (D * δq)
+
+        # Compute the contact status:
+        # 0: slipping
+        # 1: sticking
+        # 2: no contact
+        contact_status = sticking.astype(int)
+        contact_status += (δ <= 0).astype(int)
+
+        # Select the right material deformation rate depending on the contact status.
+        ṁ = jax.lax.select_n(contact_status, ṁ_slipping, ṁ_sticking, ṁ_no_contact)
+
+        # ==========================================
+        # Compute and return the final contact force
+        # ==========================================
+
+        # Sum the normal and tangential forces.
+        CW_fl = f_normal + f_tangential
+
+        return CW_fl, ṁ
+
+    @staticmethod
+    @functools.partial(jax.jit, static_argnames=("terrain",))
+    def compute_contact_force(
+        position: jtp.VectorLike,
+        velocity: jtp.VectorLike,
+        tangential_deformation: jtp.VectorLike,
+        parameters: SoftContactsParams,
+        terrain: Terrain,
+    ) -> tuple[jtp.Vector, jtp.Vector]:
+
+        CW_fl, ṁ = SoftContacts.hunt_crossley_contact_model(
+            position=position,
+            velocity=velocity,
+            tangential_deformation=tangential_deformation,
+            terrain=terrain,
+            K=parameters.K,
+            D=parameters.D,
+            mu=parameters.mu,
+            p=parameters.p,
+            q=parameters.q,
+        )
+
+        # Pack a mixed 6D force.
+        CW_f = jnp.hstack([CW_fl, jnp.zeros(3)])
+
+        # Compute the 6D force transform from the mixed to the inertial-fixed frame.
+        W_Xf_CW = jaxsim.math.Adjoint.from_quaternion_and_translation(
+            translation=jnp.array(position), inverse=True
+        ).T
+
+        # Compute the 6D force in the inertial-fixed frame.
+        W_f = W_Xf_CW @ CW_f
+
+        return W_f, ṁ
+
+    @jax.jit
+    def compute_contact_forces(
+        self,
+        model: js.model.JaxSimModel,
+        data: js.data.JaxSimModelData,
+    ) -> tuple[jtp.Matrix, dict[str, jtp.PyTree]]:
         """
-        Build a zero `SoftContactsState` from a `JaxSimModel`.
+        Compute the contact forces.
 
         Args:
-            model: The `JaxSimModel` associated with the soft contacts state.
+            model: The model to consider.
+            data: The data of the considered model.
 
         Returns:
-            A zero `SoftContactsState` instance.
+            A tuple containing as first element the computed contact forces, and as
+            second element a dictionary with derivative of the material deformation.
         """
 
-        return SoftContactsState.build_from_jaxsim_model(model=model)
+        # Initialize the model and data this contact model is operating on.
+        # This will raise an exception if either the contact model or the
+        # contact parameters are not compatible.
+        model, data = self.initialize_model_and_data(model=model, data=data)
 
-    def valid(self, model: js.model.JaxSimModel) -> bool:
-        """
-        Check if the `SoftContactsState` is valid for a given `JaxSimModel`.
+        # Compute the position and linear velocities (mixed representation) of
+        # all collidable points belonging to the robot.
+        W_p_C, W_ṗ_C = js.contact.collidable_point_kinematics(model=model, data=data)
 
-        Args:
-            model: The `JaxSimModel` to validate the `SoftContactsState` against.
+        # Extract the material deformation corresponding to the collidable points.
+        m = data.state.extended["tangential_deformation"]
 
-        Returns:
-            `True` if the soft contacts state is valid for the given `JaxSimModel`,
-            `False` otherwise.
-        """
+        # Compute the contact forces for all collidable points.
+        # Since we treat them as independent, we can vmap the computation.
+        W_f, ṁ = jax.vmap(
+            lambda p, v, m: SoftContacts.compute_contact_force(
+                position=p,
+                velocity=v,
+                tangential_deformation=m,
+                parameters=data.contacts_params,
+                terrain=model.terrain,
+            )
+        )(W_p_C, W_ṗ_C, m)
 
-        shape = self.tangential_deformation.shape
-        expected = (len(model.kin_dyn_parameters.contact_parameters.body), 3)
-
-        if shape != expected:
-            return False
-
-        return True
+        return W_f, dict(m_dot=ṁ)

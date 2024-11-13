@@ -3,7 +3,8 @@ from __future__ import annotations
 import copy
 import dataclasses
 import functools
-from typing import Any, Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -393,7 +394,7 @@ class KinematicGraph(Sequence[LinkDescription]):
             return copy.deepcopy(self)
 
         # Check if all considered joints are part of the full kinematic graph
-        if len(set(considered_joints) - set(j.name for j in full_graph.joints)) != 0:
+        if len(set(considered_joints) - {j.name for j in full_graph.joints}) != 0:
             extra_j = set(considered_joints) - {j.name for j in full_graph.joints}
             msg = f"Not all joints to consider are part of the graph ({{{extra_j}}})"
             raise ValueError(msg)
@@ -444,7 +445,7 @@ class KinematicGraph(Sequence[LinkDescription]):
                 msg.format(
                     link_to_remove.name,
                     self.joints_connection_dict[
-                        (parent_of_link_to_remove.name, link_to_remove.name)
+                        parent_of_link_to_remove.name, link_to_remove.name
                     ].name,
                     parent_of_link_to_remove.name,
                 )
@@ -535,8 +536,8 @@ class KinematicGraph(Sequence[LinkDescription]):
             root_link_name=full_graph.root.name,
         )
 
-        assert set(f.name for f in self.frames).isdisjoint(
-            set(f.name for f in unconnected_frames + reduced_frames)
+        assert {f.name for f in self.frames}.isdisjoint(
+            {f.name for f in unconnected_frames + reduced_frames}
         )
 
         for link in unconnected_links:
@@ -797,7 +798,7 @@ class KinematicGraphTransforms:
         self._transform_cache.clear()
 
         # Update initial joint positions.
-        for joint_name, position in zip(joint_names, s):
+        for joint_name, position in zip(joint_names, s, strict=True):
             self._initial_joint_positions[joint_name] = position
 
     def transform(self, name: str) -> npt.NDArray:
@@ -852,7 +853,7 @@ class KinematicGraphTransforms:
 
             # Get the joint between the link and its parent.
             parent_joint = self.graph.joints_connection_dict[
-                (link.parent.name, link.name)
+                link.parent.name, link.name
             ]
 
             # Get the transform of the parent joint.
